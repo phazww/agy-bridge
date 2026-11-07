@@ -2,6 +2,7 @@
 
 **Switch between Claude Code / Desktop, Google Antigravity 2.0, OpenAI Codex, and WorkBuddy mid-task — without losing context, git worktrees, or ever opening Terminal.**
 
+[![Release](https://img.shields.io/github/v/release/phazww/agy-bridge)](https://github.com/phazww/agy-bridge/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B%20(Zero%20Deps)-green.svg)](./agy-bridge)
 [![Platform: macOS](https://img.shields.io/badge/Platform-macOS-black.svg)](#)
