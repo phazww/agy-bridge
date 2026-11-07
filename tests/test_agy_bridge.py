@@ -559,6 +559,44 @@ class TestAgyBridgeV03(unittest.TestCase):
             else:
                 os.environ["CLAUDE_PROJECT_DIR"] = old_env
 
+    def test_13_active_dev_server_port_detection_and_open_questions(self) -> None:
+        import socket
+
+        repo = self.tmp_dir / "devsrv-repo"
+        self._init_git_repo(repo)
+        ab.record_repo_decision(
+            repo,
+            summary="Should SeedShop restock timer persist across server restarts?",
+            reason="Need to decide between MemoryStoreService vs global epoch math",
+            kind="open_question",
+            agent="claude",
+        )
+
+        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        old_cwd = os.getcwd()
+        try:
+            srv_sock.bind(("127.0.0.1", 0))
+            srv_sock.listen(1)
+            port = srv_sock.getsockname()[1]
+            os.chdir(repo)
+
+            found_servers = ab.discover_project_dev_servers([repo])
+            ports = [s["port"] for s in found_servers]
+            self.assertIn(port, ports)
+
+            state_md = ab.build_auto_state_block("devsrv-repo", repo, "test-id", [], [])
+            self.assertIn(f"localhost:{port}", state_md)
+            self.assertIn("Active Dev Servers", state_md)
+            self.assertIn("OPEN QUESTION", state_md)
+            self.assertIn("Should SeedShop restock timer persist across server restarts?", state_md)
+
+            handoff_md = ab.generate_handoff_markdown("devsrv-repo", repo, repo, "test-id", {})
+            self.assertIn(f"localhost:{port}", handoff_md)
+            self.assertIn("Active Dev Servers", handoff_md)
+        finally:
+            os.chdir(old_cwd)
+            srv_sock.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

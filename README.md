@@ -19,8 +19,9 @@ When you hit a rate limit mid-task in **Claude Code**, or switch to **Antigravit
 `agy-bridge v0.3` solves all three **with zero Terminal commands required during your workflow**:
 - **Invisible Lifecycle Hooks** (`SessionStart`, `UserPromptSubmit` / `PreInvocation`, `PostToolUse`, `Stop`, `StopFailure`) checkpoint progress after every file edit and rate-limit crash.
 - **Zero Git Noise**: Tracked `CLAUDE.md` and `AGENTS.md` stay **100% clean**. A ~350-token Progress State is dynamically injected into agent memory only when another IDE actually changed state (**0 extra tokens** on normal mid-session turns via a SHA-256 delta cursor).
-- **Shared SQLite WAL + FTS5 Across All Worktrees**: Stored once in `$(git rev-parse --git-common-dir)/agy-bridge/state.sqlite` with `fcntl.flock` concurrency safety.
-- **Built-in MCP Server (`agy-bridge mcp`)**: Just tell any IDE in plain chat *"continue where Claude stopped"* or *"check what the other agent did"* — the agent calls the native MCP tool automatically.
+- **Shared SQLite WAL + FTS5 Across All Worktrees**: Stored once in `$(git rev-parse --git-common-dir)/agy-bridge/state.sqlite` with `fcntl.flock` concurrency safety, linking all `.claude/worktrees/<name>` with the base repository and tracking uncommitted diffs, architectural decisions, failed dead-ends, and open questions.
+- **Active Dev Servers & Port Detection**: Automatically detects running local dev servers (`localhost:3000 (node, PID 12345)`) bound to the project or active worktree so the next agent never spawns a duplicate server on a busy port.
+- **Built-in MCP Server (`agy-bridge mcp`, <180 tokens schema)**: Just tell any IDE in plain chat *"continue where Claude stopped"* or *"check what the other agent did"* — the agent calls the native MCP tool automatically.
 
 ---
 
@@ -94,9 +95,9 @@ Once installed, you **never need to open Terminal** to sync or switch IDEs:
 
 | MCP Tool | Description |
 | :--- | :--- |
-| `bridge_get_state` | Returns the live ~350-token Progress State, modified files matrix, `git status`, `StopFailure` alerts, and recorded decisions/dead-ends. |
-| `bridge_continue_task` | One-step failover: auto-detects the latest active or interrupted session across IDEs, syncs all 3 layers, and continues in the current or target IDE. |
-| `bridge_record_decision` | Records an architectural `decision` or rejected `dead_end` in `<git-common-dir>/agy-bridge/state.sqlite` with `HEAD sha` attribution. |
+| `bridge_get_state` | Returns the live ~350-token Progress State, modified files matrix, multi-worktree `git status`, active dev servers/ports, `StopFailure` alerts, and recorded decisions/dead-ends/open-questions. |
+| `bridge_continue_task` | One-step failover: auto-detects the latest active or interrupted session across IDEs, syncs all 3 layers + running dev servers, and continues in the current or target IDE. |
+| `bridge_record_decision` | Records an architectural `decision`, rejected `dead_end`, or `open_question` in `<git-common-dir>/agy-bridge/state.sqlite` with `HEAD sha` attribution. |
 | `bridge_search_history` | Instant SQLite `FTS5` full-text search across all unabridged session transcripts of the project. |
 | `bridge_send_to_claude` | Injects a prompt directly into a live open Claude Desktop / CLI tab via Unix domain socket (`/tmp/cc-socks/<pid>.sock`). |
 | `bridge_spawn_agy_chat` | Registers the project in Antigravity 2.0 (with Turbo / Allow / Eager policies) and spawns + focuses a live chat tab. |

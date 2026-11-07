@@ -2427,6 +2427,177 @@ def extract_clean_progress_text(raw_turn_text: str, max_chars: int = 380) -> str
     return joined
 
 
+IGNORED_DEV_SERVER_PROCS = (
+    "rapportd",
+    "controlcenter",
+    "raycast",
+    "mdnsresponder",
+    "antigravity",
+    "language_server",
+    "claude",
+    "codex",
+    "workbuddy",
+    "cursor",
+    "windsurf",
+    "electron",
+    "onedrive",
+    "dropbox",
+    "spotify",
+    "discord",
+    "figmadaemon",
+    "sharingd",
+    "airplayxpchelper",
+)
+
+
+def discover_project_dev_servers(all_git_paths: List[Path]) -> List[Dict[str, Any]]:
+    """
+    Fast (<40ms) auto-detection of running local dev servers / listening TCP ports
+    bound to the repository or any of its git worktrees (via process `cwd` or command line).
+    Prevents the next agent from spawning a duplicate server on an already occupied port.
+    """
+    resolved_prefixes: List[str] = []
+    for p in all_git_paths:
+        if p.exists():
+            for cand_str in (str(p), str(p.resolve())):
+                clean_p = cand_str.rstrip("/")
+                if clean_p and clean_p not in resolved_prefixes:
+                    resolved_prefixes.append(clean_p)
+    if not resolved_prefixes:
+        return []
+
+    lsof_bin = "/usr/sbin/lsof" if Path("/usr/sbin/lsof").exists() else shutil.which("lsof")
+    if not lsof_bin:
+        return []
+
+    try:
+        r_listen = subprocess.run(
+            [lsof_bin, "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+    except Exception:
+        return []
+
+    if r_listen.returncode != 0 and not r_listen.stdout:
+        return []
+
+    pid_cmd: Dict[str, str] = {}
+    pid_ports: Dict[str, List[int]] = {}
+    cur_pid = ""
+    cur_cmd = ""
+    for line in r_listen.stdout.splitlines():
+        if not line:
+            continue
+        tag, val = line[0], line[1:]
+        if tag == "p":
+            cur_pid = val.strip()
+            cur_cmd = ""
+        elif tag == "c" and cur_pid:
+            cur_cmd = val.strip()
+            low_c = cur_cmd.lower()
+            if any(low_c.startswith(ig) for ig in IGNORED_DEV_SERVER_PROCS):
+                cur_pid = ""
+            else:
+                pid_cmd[cur_pid] = cur_cmd
+        elif tag == "n" and cur_pid:
+            if ":" in val:
+                port_part = val.rsplit(":", 1)[-1].strip()
+                if port_part.isdigit():
+                    port_num = int(port_part)
+                    pid_ports.setdefault(cur_pid, [])
+                    if port_num not in pid_ports[cur_pid]:
+                        pid_ports[cur_pid].append(port_num)
+
+    if not pid_ports:
+        return []
+
+    cand_pids = list(pid_ports.keys())[:40]
+    pid_list_arg = ",".join(cand_pids)
+
+    pid_cwd: Dict[str, str] = {}
+    try:
+        r_cwd = subprocess.run(
+            [lsof_bin, "-a", "-p", pid_list_arg, "-d", "cwd", "-Fn"],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+        c_pid = ""
+        for line in r_cwd.stdout.splitlines():
+            if not line:
+                continue
+            if line.startswith("p"):
+                c_pid = line[1:].strip()
+            elif line.startswith("n") and c_pid:
+                pid_cwd[c_pid] = line[1:].strip()
+    except Exception:
+        pass
+
+    pid_args: Dict[str, str] = {}
+    try:
+        r_ps = subprocess.run(
+            ["/bin/ps", "-o", "pid=,args=", "-p", pid_list_arg],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+        for line in r_ps.stdout.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            parts = s.split(None, 1)
+            if len(parts) == 2 and parts[0].isdigit():
+                pid_args[parts[0]] = parts[1].strip()
+    except Exception:
+        pass
+
+    def _matches_repo(cwd_val: str, args_val: str) -> bool:
+        cands = [cwd_val.rstrip("/")] if cwd_val else []
+        if cwd_val:
+            try:
+                res_c = str(Path(cwd_val).resolve()).rstrip("/")
+                if res_c not in cands:
+                    cands.append(res_c)
+            except Exception:
+                pass
+        for c in cands:
+            for pref in resolved_prefixes:
+                if c == pref or c.startswith(pref + "/"):
+                    return True
+        if args_val:
+            for pref in resolved_prefixes:
+                if pref in args_val:
+                    return True
+        return False
+
+    results: List[Dict[str, Any]] = []
+    seen_port_pid = set()
+    for pid_str, ports in pid_ports.items():
+        c_val = pid_cwd.get(pid_str, "")
+        a_val = pid_args.get(pid_str, "")
+        if not _matches_repo(c_val, a_val):
+            continue
+        proc_name = pid_cmd.get(pid_str, "server")
+        for pt in sorted(ports):
+            key = (pt, int(pid_str))
+            if key in seen_port_pid:
+                continue
+            seen_port_pid.add(key)
+            results.append({
+                "port": pt,
+                "endpoint": f"localhost:{pt}",
+                "pid": int(pid_str),
+                "process": proc_name,
+                "command": (a_val or proc_name)[:120],
+                "cwd": c_val,
+            })
+
+    results.sort(key=lambda x: (x["port"], x["pid"]))
+    return results
+
+
 def build_auto_state_block(
     project_name: str,
     active_workspace: Path,
@@ -2506,18 +2677,32 @@ def build_auto_state_block(
     lines.append("")
 
     if decisions:
-        lines.append(f"### {sec_num}. Shared Architectural Decisions & Dead-Ends (Do Not Repeat)")
+        lines.append(f"### {sec_num}. Shared Architectural Decisions, Dead-Ends & Open Questions")
         sec_num += 1
         for d in decisions:
-            k_tag = "🚫 DEAD-END" if d.get("kind") == "dead_end" else "✅ DECISION"
+            kind_val = d.get("kind") or "decision"
+            if kind_val == "dead_end":
+                k_tag = "🚫 DEAD-END"
+            elif kind_val == "open_question":
+                k_tag = "❓ OPEN QUESTION"
+            else:
+                k_tag = "✅ DECISION"
             r_str = f" — *Reason*: {d['reason']}" if d.get("reason") else ""
             lines.append(f"- **{k_tag}** (`[{str(d.get('agent', '')).upper()}]`, `HEAD={d.get('head_sha', '')}`): {d.get('summary', '')}{r_str}")
         lines.append("")
 
-    # Section: Live Git & Worktrees State
+    # Section: Live Git, Worktrees & Active Dev Servers State
     lines.append(f"### {sec_num}. Live Git & Worktrees State")
     sec_num += 1
     base_repo_w, _, all_wt_paths = resolve_repo_and_worktree(active_workspace)
+    dev_servers = discover_project_dev_servers(all_wt_paths)
+    if dev_servers:
+        srv_items = [
+            f"`{s['endpoint']}` (`{s['process']}`, PID `{s['pid']}`"
+            + (f", `cwd={Path(s['cwd']).name}`)" if s.get("cwd") else ")")
+            for s in dev_servers
+        ]
+        lines.append(f"- **🟢 Active Dev Servers**: {', '.join(srv_items)} *(already running — do NOT spawn duplicate servers on these ports)*")
     if len(all_wt_paths) > 1:
         for wp in all_wt_paths:
             if not wp.exists():
@@ -2997,6 +3182,13 @@ def generate_handoff_markdown(
     lines.append(f"- **Base Repository**: `{base_repo}`")
     lines.append(f"- **Active Workspace / Worktree**: `{active_workspace}`")
     lines.append(f"- **Active Git Branch**: `{branch_out or parsed_session.get('branch') or 'main'}`")
+    _, _, handoff_wt_paths = resolve_repo_and_worktree(active_workspace)
+    handoff_dev_servers = discover_project_dev_servers(handoff_wt_paths)
+    if handoff_dev_servers:
+        lines.append(
+            "- **Active Dev Servers**: "
+            + ", ".join(f"`{s['endpoint']}` (`{s['process']}`, PID `{s['pid']}`)" for s in handoff_dev_servers)
+        )
     lines.append(f"- **Antigravity Project ID**: `{agy_project_id}` (Turbo / Allow / Eager enabled)")
     lines.append(f"- **Most Recent Agent**: `{parsed_session.get('agent', 'unknown')}` (`{parsed_session.get('sessionId', '')}`)")
     if parsed_session.get("title"):
@@ -3992,13 +4184,22 @@ def execute_continue_failover(
     mfiles = (latest_session or {}).get("modifiedFiles") or []
     _, status_out, _ = run_git(active_ws, ["status", "-s"])
     _, head_sha, _ = run_git(active_ws, ["rev-parse", "--short", "HEAD"])
+    dev_servers = discover_project_dev_servers(all_git_paths)
+    dev_srv_line = (
+        f"- **Активные dev-серверы (не запускать повторно)**: "
+        + ", ".join(f"`{s['endpoint']}` (`{s['process']}`, PID `{s['pid']}`)" for s in dev_servers)
+        + "\n"
+        if dev_servers
+        else ""
+    )
 
     recovery_prompt = custom_prompt or (
         f"Перехват задачи из `{source_agent}` (сессия `{source_sid[:8]}`, проект `{project_name}`, `HEAD={head_sha}`).\n"
         f"- **Исходная цель**: {init_goal or '(см. HANDOFF_CONTEXT.md)'}\n"
         f"- **Последний запрос пользователя**: {last_user or '(см. HANDOFF_CONTEXT.md)'}\n"
         f"- **На чём остановился предыдущий агент**: {last_assistant or '(оборвалось на полпути)'}\n"
-        f"- **Изменённые файлы**: {', '.join(Path(f).name for f in mfiles[:10]) if mfiles else '(нет)'}\n\n"
+        f"- **Изменённые файлы**: {', '.join(Path(f).name for f in mfiles[:10]) if mfiles else '(нет)'}\n"
+        f"{dev_srv_line}\n"
         f"Прочитай `.agy-bridge/LIVE_STATE.md` и `HANDOFF_CONTEXT.md` в `{active_ws}` и сразу продолжи выполнение задачи с того шага, где остановились."
     )
 
@@ -4042,6 +4243,7 @@ def execute_continue_failover(
         "lastPrompt": last_user,
         "lastOutcome": last_assistant,
         "modifiedFiles": mfiles,
+        "activeDevServers": dev_servers,
         "recoveryPrompt": recovery_prompt,
         "action": action_result,
         "liveState": live_state_text,
@@ -4542,8 +4744,8 @@ MCP_TOOLS_SCHEMA = [
             "type": "object",
             "properties": {
                 "project": {"type": "string", "description": "Project path/name (optional)"},
-                "kind": {"type": "string", "enum": ["decision", "dead_end"]},
-                "summary": {"type": "string", "description": "Decision or failed approach"},
+                "kind": {"type": "string", "enum": ["decision", "dead_end", "open_question"]},
+                "summary": {"type": "string", "description": "Decision, failed approach, or open question"},
                 "reason": {"type": "string", "description": "Why"},
             },
             "required": ["summary"],
