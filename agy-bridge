@@ -1479,6 +1479,10 @@ def extract_claude_message_text(
     return ""
 
 
+BASE64_BLOB_RE = re.compile(r'"data"\s*:\s*"[A-Za-z0-9+/=]{256,}"')
+PARSE_CACHE_DIR = Path(f"/tmp/agy-bridge-cache-{os.getuid()}")
+
+
 def parse_claude_or_workbuddy_jsonl(jsonl_path: Path, max_turns: int = 0) -> Dict[str, Any]:
     """
     Parses a Claude Code or WorkBuddy .jsonl transcript with FULL FIDELITY:
@@ -1486,6 +1490,7 @@ def parse_claude_or_workbuddy_jsonl(jsonl_path: Path, max_turns: int = 0) -> Dic
     - Preserves `thinking` blocks (reasoning / why approaches were chosen or rejected)
     - Preserves `tool_use` AND `tool_result` (command outputs, test results, tracebacks, errors)
     - Separates `modifiedFiles` (edited/written) from `readFiles` (inspected)
+    - Uses fast `(mtime_ns, size)` caching and strips multi-megabyte base64 image payloads before `json.loads`.
     """
     turns: List[Dict[str, str]] = []
     modified_files: List[str] = []
@@ -1495,7 +1500,16 @@ def parse_claude_or_workbuddy_jsonl(jsonl_path: Path, max_turns: int = 0) -> Dic
     branch = ""
     title = ""
     session_id = jsonl_path.stem
-    mtime = jsonl_path.stat().st_mtime if jsonl_path.exists() else 0.0
+    try:
+        st = jsonl_path.stat()
+        mtime = st.st_mtime
+        cache_key = hashlib.sha256(f"{jsonl_path}:{st.st_mtime_ns}:{st.st_size}:{max_turns}".encode("utf-8")).hexdigest()
+        cache_file = PARSE_CACHE_DIR / f"{session_id}_{cache_key[:16]}.json"
+        if cache_file.exists():
+            return json.loads(cache_file.read_text(encoding="utf-8"))
+    except Exception:
+        mtime = 0.0
+        cache_file = None
 
     # Check if Claude Desktop local_*.json has a rich title for this session
     if CLAUDE_SESSIONS_DIR.exists():
@@ -1519,6 +1533,8 @@ def parse_claude_or_workbuddy_jsonl(jsonl_path: Path, max_turns: int = 0) -> Dic
                 line = line.strip()
                 if not line:
                     continue
+                if len(line) > 16384 and "base64" in line:
+                    line = BASE64_BLOB_RE.sub('"data":"[BASE64_IMAGE_OMITTED]"', line)
                 try:
                     rec = json.loads(line)
                 except Exception:
@@ -1628,7 +1644,7 @@ def parse_claude_or_workbuddy_jsonl(jsonl_path: Path, max_turns: int = 0) -> Dic
     ordered_touched = list(modified_files) + [f for f in touched_files if f not in modified_files]
     selected_turns = turns if (max_turns <= 0 or len(turns) <= max_turns) else turns[-max_turns:]
 
-    return {
+    result = {
         "agent": "workbuddy" if ".workbuddy" in str(jsonl_path) else "claude",
         "sessionId": session_id,
         "title": title or f"Session {session_id[:8]}",
@@ -1645,6 +1661,15 @@ def parse_claude_or_workbuddy_jsonl(jsonl_path: Path, max_turns: int = 0) -> Dic
         "readFiles": read_files,
         "touchedFiles": ordered_touched,
     }
+    if cache_file is not None:
+        try:
+            PARSE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            for old_c in PARSE_CACHE_DIR.glob(f"{session_id}_*.json"):
+                old_c.unlink(missing_ok=True)
+            atomic_write_text(cache_file, json.dumps(result, ensure_ascii=False), mode=0o600)
+        except Exception:
+            pass
+    return result
 
 
 def clean_agy_user_text(raw_text: str) -> str:
@@ -2212,6 +2237,21 @@ def write_full_session_mirrors(
             rel_mirror = f".agy-bridge/sessions/{mirror_name}"
 
             all_turns = ps.get("allTurns") or ps.get("turns") or []
+            src_mtime = float(ps.get("mtime") or 0.0)
+            if mirror_path.exists() and src_mtime > 0 and mirror_path.stat().st_mtime >= src_mtime:
+                written_mirrors.append(str(mirror_path))
+                index_records.append({
+                    "agent": agent,
+                    "sessionId": sid,
+                    "title": ps.get("title", ""),
+                    "lastModified": ps.get("lastModified", ""),
+                    "totalTurns": len(all_turns),
+                    "modifiedFiles": ps.get("modifiedFiles", []),
+                    "readFiles": ps.get("readFiles", []),
+                    "mirrorFile": rel_mirror,
+                })
+                continue
+
             m_lines: List[str] = [
                 f"# Full Unabridged Session Mirror — `[{agent.upper()}]` `{sid}`",
                 "",
@@ -2359,12 +2399,18 @@ def build_auto_state_block(
             )
         lines.append("")
 
+    def _rel_path(fp: str) -> str:
+        try:
+            return str(Path(fp).resolve().relative_to(active_workspace.resolve()))
+        except Exception:
+            return Path(fp).name
+
     sec_num = 1
     # Section: Cross-Agent Modified Files Matrix + Session Mirrors
     lines.append(f"### {sec_num}. Active Sessions & Modified Files Matrix")
     sec_num += 1
     if rep_sessions:
-        for ps in rep_sessions:
+        for s_idx, ps in enumerate(rep_sessions):
             ag = ps.get("agent", "agent")
             sid = ps.get("sessionId", "")
             safe_sid = re.sub(r"[^a-zA-Z0-9_.-]", "_", sid)
@@ -2372,8 +2418,9 @@ def build_auto_state_block(
             total_t = len(ps.get("allTurns") or ps.get("turns") or [])
             mfiles = ps.get("modifiedFiles") or []
             rfiles = ps.get("readFiles") or []
-            m_str = ", ".join(f"`{Path(f).name}`" for f in mfiles[:8]) if mfiles else "*(none)*"
-            r_str = ", ".join(f"`{Path(f).name}`" for f in rfiles[:6]) if rfiles else "*(none)*"
+            max_m = 12 if s_idx == 0 else 8
+            m_str = ", ".join(f"`{_rel_path(f)}`" for f in mfiles[:max_m]) if mfiles else "*(none)*"
+            r_str = ", ".join(f"`{_rel_path(f)}`" for f in rfiles[:6]) if rfiles else "*(none)*"
             lines.append(
                 f"- **`[{ag.upper()}]`** **{ps.get('title', '')}** (`{sid[:8]}`, {total_t} turns, `{ps.get('lastModified', '')}`) → [Full Mirror]({mirror_rel})\n"
                 f"  - **Edited**: {m_str} | **Read**: {r_str}"
@@ -2406,7 +2453,7 @@ def build_auto_state_block(
     # Section: Clean Progress Summary per Active Agent (No raw Thinking/Tool spam)
     if rep_sessions:
         lines.append(f"### {sec_num}. Latest Progress Snapshot (Per Active IDE)")
-        for ps in rep_sessions:
+        for s_idx, ps in enumerate(rep_sessions):
             ag = ps.get("agent", "agent")
             sid = ps.get("sessionId", "")
             safe_sid = re.sub(r"[^a-zA-Z0-9_.-]", "_", sid)
@@ -2415,28 +2462,39 @@ def build_auto_state_block(
             if not all_turns:
                 continue
 
-            init_goal = extract_clean_progress_text(ps.get("initialUserGoal") or "", max_chars=240)
-            last_user = ""
-            last_assistant = ""
+            outcome_limit = 1500 if s_idx == 0 else 420
+            init_goal = extract_clean_progress_text(ps.get("initialUserGoal") or "", max_chars=260)
+            assistant_outcomes: List[str] = []
+            user_prompts: List[str] = []
             fallback_tool_assistant = ""
             for t in reversed(all_turns):
-                if t.get("role") == "assistant" and not last_assistant:
-                    cand = extract_clean_progress_text(t.get("text") or "", max_chars=380)
+                if t.get("role") == "assistant" and len(assistant_outcomes) < (2 if s_idx == 0 else 1):
+                    cand = extract_clean_progress_text(t.get("text") or "", max_chars=outcome_limit)
                     if cand.startswith("*(Executed tools:"):
                         if not fallback_tool_assistant:
                             fallback_tool_assistant = cand
-                    elif cand:
-                        last_assistant = cand
-                elif t.get("role") == "user" and not last_user:
-                    last_user = extract_clean_progress_text(t.get("text") or "", max_chars=260)
-                if last_user and last_assistant:
+                    elif cand and cand != "No response requested." and cand not in assistant_outcomes:
+                        assistant_outcomes.append(cand)
+                elif t.get("role") == "user" and len(user_prompts) < (2 if s_idx == 0 else 1):
+                    ucand = extract_clean_progress_text(t.get("text") or "", max_chars=280)
+                    if ucand and ucand not in ("[Request interrupted by user]", "Try again") and ucand not in user_prompts:
+                        user_prompts.append(ucand)
+                if len(assistant_outcomes) >= (2 if s_idx == 0 else 1) and len(user_prompts) >= (2 if s_idx == 0 else 1):
                     break
-            if not last_assistant and fallback_tool_assistant:
-                last_assistant = fallback_tool_assistant
+            if not assistant_outcomes and fallback_tool_assistant:
+                assistant_outcomes.append(fallback_tool_assistant)
+
+            last_user = user_prompts[0] if user_prompts else ""
+            last_assistant = assistant_outcomes[0] if assistant_outcomes else ""
 
             lines.append(f"- **`[{ag.upper()} {sid[:8]}]`** ([Full Log]({mirror_rel})):")
             if init_goal and init_goal != last_user:
                 lines.append(f"  - **Goal**: {init_goal}")
+            if s_idx == 0 and len(assistant_outcomes) > 1:
+                prev_u = user_prompts[1] if len(user_prompts) > 1 else ""
+                if prev_u:
+                    lines.append(f"  - **Prev Prompt**: {prev_u}")
+                lines.append(f"  - **Prev Outcome**: {assistant_outcomes[1][:900]}")
             if last_user:
                 lines.append(f"  - **Last Prompt**: {last_user}")
             if last_assistant:
@@ -2447,6 +2505,9 @@ def build_auto_state_block(
     return redact_secrets("\n".join(lines) + "\n")
 
 
+AUTO_BOILERPLATE_MARKER = "Project managed and synchronized across **Antigravity 2.0**, **Claude Code / Desktop**"
+
+
 def sync_claude_and_agents_md(
     paths: List[Path],
     project_name: str,
@@ -2454,11 +2515,10 @@ def sync_claude_and_agents_md(
     write_tracked_docs: bool = False,
 ) -> List[str]:
     """
-    Synchronizes CLAUDE.md and AGENTS.md across all project paths (worktree + base repo),
-    AND writes the live auto-state block into git-ignored `.agy-bridge/LIVE_STATE.md` and
+    Writes the live auto-state block into git-ignored `.agy-bridge/LIVE_STATE.md` and
     `<git-common-dir>/agy-bridge/LIVE_STATE.md`.
-    By default (`write_tracked_docs=False`), keeps `CLAUDE.md` and `AGENTS.md` 100% clean of auto-blocks
-    so `git status` is never dirtied (since hooks inject `LIVE_STATE.md` dynamically at SessionStart / Turn start!).
+    By default (`write_tracked_docs=False`), NEVER creates untracked `CLAUDE.md` or `AGENTS.md` files
+    if the repository doesn't already have them, and cleans any legacy `AUTO-STATE` blocks so `git status` stays 100% clean.
     """
     synced_files: List[str] = []
     candidates: List[Tuple[int, float, str, Path]] = []
@@ -2470,27 +2530,33 @@ def sync_claude_and_agents_md(
             if f.exists() and f.stat().st_size > 0:
                 raw_txt = f.read_text(encoding="utf-8", errors="replace")
                 clean_human = strip_auto_state_block(raw_txt).strip()
+                if AUTO_BOILERPLATE_MARKER in clean_human and len(clean_human) < 600:
+                    # If this was only an untracked auto-generated stub from an earlier run, remove it to keep git status clean
+                    rc, _, _ = run_git(p, ["ls-files", "--error-unmatch", fname])
+                    if rc != 0 and not write_tracked_docs:
+                        f.unlink(missing_ok=True)
+                    continue
                 if clean_human:
                     candidates.append((len(clean_human.encode("utf-8")), f.stat().st_mtime, clean_human, f))
 
-    if not candidates:
-        primary = paths[0]
-        if is_non_project_dir(primary):
-            return synced_files
-        primary.mkdir(parents=True, exist_ok=True)
-        base_human_doc = (
-            f"# {project_name}\n\n"
-            f"Project managed and synchronized across **Antigravity 2.0**, **Claude Code / Desktop**, **Codex**, and **WorkBuddy** via `agy-bridge`.\n\n"
-            f"- **Workspace Path**: `{primary}`\n"
-            f"- **Live Cross-Agent State**: [`.agy-bridge/LIVE_STATE.md`](./.agy-bridge/LIVE_STATE.md)\n"
-            f"- **Full Cross-Agent Context**: [`HANDOFF_CONTEXT.md`](./HANDOFF_CONTEXT.md) and [`.agy-bridge/sessions/`](./.agy-bridge/sessions/).\n"
-        )
-    else:
+    base_human_doc = ""
+    if candidates:
         candidates.sort(key=lambda item: (item[1], item[0]), reverse=True)
         base_human_doc = candidates[0][2] + "\n"
+    elif write_tracked_docs:
+        primary = paths[0]
+        if not is_non_project_dir(primary):
+            primary.mkdir(parents=True, exist_ok=True)
+            base_human_doc = (
+                f"# {project_name}\n\n"
+                f"{AUTO_BOILERPLATE_MARKER}, **Codex**, and **WorkBuddy** via `agy-bridge`.\n\n"
+                f"- **Workspace Path**: `{primary}`\n"
+                f"- **Live Cross-Agent State**: [`.agy-bridge/LIVE_STATE.md`](./.agy-bridge/LIVE_STATE.md)\n"
+                f"- **Full Cross-Agent Context**: [`HANDOFF_CONTEXT.md`](./HANDOFF_CONTEXT.md) and [`.agy-bridge/sessions/`](./.agy-bridge/sessions/).\n"
+            )
 
-    final_doc_content = base_human_doc.rstrip() + "\n"
-    if write_tracked_docs and auto_state_block:
+    final_doc_content = base_human_doc.rstrip() + "\n" if base_human_doc else ""
+    if write_tracked_docs and auto_state_block and final_doc_content:
         final_doc_content = final_doc_content + "\n" + auto_state_block.strip() + "\n"
 
     for p in paths:
@@ -2506,12 +2572,16 @@ def sync_claude_and_agents_md(
                 atomic_write_text(common_live, auto_state_block, mode=0o600)
             except Exception:
                 pass
-        for fname in ("CLAUDE.md", "AGENTS.md"):
-            target = p / fname
-            existing = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
-            if existing != final_doc_content:
-                atomic_write_text(target, final_doc_content)
-            synced_files.append(str(target))
+        if final_doc_content:
+            for fname in ("CLAUDE.md", "AGENTS.md"):
+                target = p / fname
+                # When write_tracked_docs=False, only update CLAUDE.md / AGENTS.md that already exist on disk
+                if not write_tracked_docs and not target.exists():
+                    continue
+                existing = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
+                if existing != final_doc_content:
+                    atomic_write_text(target, final_doc_content)
+                synced_files.append(str(target))
 
     return synced_files
 
@@ -3874,9 +3944,11 @@ def cmd_hook_sync(args: argparse.Namespace) -> int:
 
             # Only run full 3-layer sync on write/stop events (PostToolUse, Stop, StopFailure),
             # or on SessionStart / PreInvocation / UserPromptSubmit if LIVE_STATE.md does not exist yet.
-            # This makes PreInvocation / UserPromptSubmit instant (<5ms) and prevents an agent from
-            # re-triggering state changes on its own read_file/tool steps!
-            need_full_sync = event_name in ("PostToolUse", "Stop", "StopFailure", "SessionStart") or not live_file.exists()
+            # For PostToolUse, debounce if LIVE_STATE.md was updated within the last 15s so parallel edit_file batches run in <2ms.
+            need_full_sync = event_name in ("Stop", "StopFailure", "SessionStart") or not live_file.exists()
+            if event_name == "PostToolUse":
+                if not live_file.exists() or (time.time() - live_file.stat().st_mtime) >= 15.0:
+                    need_full_sync = True
 
             if need_full_sync:
                 sync_ns = argparse.Namespace(target=str(p), workspace=str(p), quiet=True, write_docs=False)
