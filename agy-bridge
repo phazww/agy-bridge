@@ -405,7 +405,7 @@ def load_claude_worktrees() -> Dict[str, Dict[str, Any]]:
 
 
 def find_worktrees_for_repo(repo_path: Path) -> List[Path]:
-    """Finds all worktrees belonging to repo_path (or if repo_path is inside a worktree, resolves both)."""
+    """Finds all worktrees belonging to repo_path (via git-worktrees.json, .claude/worktrees, and `git worktree list`)."""
     resolved = repo_path.expanduser().resolve()
     worktrees: List[Path] = []
     wt_map = load_claude_worktrees()
@@ -419,14 +419,53 @@ def find_worktrees_for_repo(repo_path: Path) -> List[Path]:
         for child in sorted(local_wt_dir.iterdir(), key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True):
             if child.is_dir() and child.resolve() not in worktrees:
                 worktrees.append(child.resolve())
+    if resolved.exists():
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(resolved), "worktree", "list", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if proc.returncode == 0:
+                for ln in proc.stdout.splitlines():
+                    if ln.startswith("worktree "):
+                        wp = Path(ln[9:].strip()).resolve()
+                        if wp.exists() and wp != resolved and wp not in worktrees:
+                            worktrees.append(wp)
+        except Exception:
+            pass
     return worktrees
+
+
+def _workspace_activity_mtime(p: Path) -> float:
+    """Returns the latest activity timestamp for a repo/worktree across Claude sessions, git index, and docs."""
+    best = 0.0
+    if not p.exists():
+        return best
+    for fn in ("CLAUDE.md", "AGENTS.md", ".git/index", ".git/HEAD"):
+        f = p / fn
+        if f.exists():
+            try:
+                best = max(best, f.stat().st_mtime)
+            except Exception:
+                pass
+    slug = "-" + re.sub(r"[^a-zA-Z0-9]", "-", str(p.resolve()).lstrip("/"))
+    slug_dir = CLAUDE_PROJECTS_DIR / slug
+    if slug_dir.exists():
+        for jf in slug_dir.glob("*.jsonl"):
+            try:
+                best = max(best, jf.stat().st_mtime)
+            except Exception:
+                pass
+    return best
 
 
 def resolve_repo_and_worktree(target_path: Path) -> Tuple[Path, Path, List[Path]]:
     """
     Given either a base repo path or a worktree path:
     Returns (base_repo_path, active_workspace_path, all_git_paths).
-    Active workspace is the worktree if it has a newer CLAUDE.md or recent git activity, else base_repo_path.
+    Active workspace is the worktree if it has newer session/git activity than base_repo_path.
     """
     resolved = target_path.expanduser().resolve()
     parts = resolved.parts
@@ -439,6 +478,9 @@ def resolve_repo_and_worktree(target_path: Path) -> Tuple[Path, Path, List[Path]
             all_paths = [wt_root]
             if base_repo.exists() and base_repo not in all_paths:
                 all_paths.append(base_repo)
+            for extra_wt in find_worktrees_for_repo(base_repo):
+                if extra_wt not in all_paths:
+                    all_paths.append(extra_wt)
             return base_repo, wt_root, all_paths
 
     # Check git-worktrees.json in case it's an external worktree
@@ -454,17 +496,10 @@ def resolve_repo_and_worktree(target_path: Path) -> Tuple[Path, Path, List[Path]
     if not worktrees:
         return resolved, resolved, [resolved]
 
-    # Pick the best worktree if its CLAUDE.md or HEAD is newer than base_repo's CLAUDE.md
-    best_wt = worktrees[0]
-    base_claude = resolved / "CLAUDE.md"
-    wt_claude = best_wt / "CLAUDE.md"
-    active = resolved
-    if wt_claude.exists():
-        if not base_claude.exists():
-            active = best_wt
-        else:
-            if wt_claude.stat().st_mtime >= base_claude.stat().st_mtime or wt_claude.stat().st_size > base_claude.stat().st_size:
-                active = best_wt
+    # Pick whichever path (base_repo or worktree) has the most recent session/git activity
+    candidates = [resolved] + worktrees
+    candidates.sort(key=_workspace_activity_mtime, reverse=True)
+    active = candidates[0]
 
     all_paths: List[Path] = []
     if active != resolved:
@@ -2438,11 +2473,23 @@ def build_auto_state_block(
             lines.append(f"- **{k_tag}** (`[{str(d.get('agent', '')).upper()}]`, `HEAD={d.get('head_sha', '')}`): {d.get('summary', '')}{r_str}")
         lines.append("")
 
-    # Section: Live Git State
-    lines.append(f"### {sec_num}. Live Git State")
+    # Section: Live Git & Worktrees State
+    lines.append(f"### {sec_num}. Live Git & Worktrees State")
     sec_num += 1
+    base_repo_w, _, all_wt_paths = resolve_repo_and_worktree(active_workspace)
+    if len(all_wt_paths) > 1:
+        for wp in all_wt_paths:
+            if not wp.exists():
+                continue
+            _, w_br, _ = run_git(wp, ["branch", "--show-current"])
+            _, w_sha, _ = run_git(wp, ["rev-parse", "--short", "HEAD"])
+            _, w_st, _ = run_git(wp, ["status", "-s"])
+            dirty_cnt = len([ln for ln in (w_st or "").splitlines() if ln.strip()])
+            role_tag = "ACTIVE WORKTREE" if wp == active_workspace else ("BASE REPO" if wp == base_repo_w else "WORKTREE")
+            dirty_tag = f"⚠️ {dirty_cnt} uncommitted file(s)" if dirty_cnt > 0 else "clean"
+            lines.append(f"- **`[{role_tag}]`** `{wp}` (`{w_br or 'HEAD'}@{w_sha or 'init'}`, {dirty_tag})")
     lines.append("```text")
-    lines.append(f"# git status -s:\n{status_out or '(clean working tree)'}")
+    lines.append(f"# git status -s ({active_workspace.name}):\n{status_out or '(clean working tree)'}")
     if diff_stat:
         lines.append(f"\n# git diff --stat:\n{diff_stat}")
     if log_out:
@@ -4251,72 +4298,72 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 MCP_TOOLS_SCHEMA = [
     {
         "name": "bridge_get_state",
-        "description": "Get live cross-agent progress state, modified files matrix, git status, and shared architectural decisions/dead-ends across Antigravity, Claude, Codex, and WorkBuddy.",
+        "description": "Get live cross-agent progress, modified files, worktrees, git status, and decisions.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "project": {"type": "string", "description": "Optional project path or name (auto-detects current or most recent project if omitted)"},
+                "project": {"type": "string", "description": "Project path/name (optional)"},
             },
         },
     },
     {
         "name": "bridge_continue_task",
-        "description": "One-click failover: pick up a task where another agent (Claude, Antigravity, Codex, WorkBuddy) stopped or hit a rate limit. Returns the full recovery context and optionally launches/messages the target IDE.",
+        "description": "Continue task where another IDE stopped/hit limit.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "project": {"type": "string", "description": "Optional project path or name (auto-detects if omitted)"},
-                "to_agent": {"type": "string", "description": "Target IDE: 'agy', 'claude', 'codex', or 'current' (use 'current' if calling from inside the chat where you want to continue)"},
-                "prompt": {"type": "string", "description": "Optional custom continuation instructions"},
+                "project": {"type": "string", "description": "Project path/name (optional)"},
+                "to_agent": {"type": "string", "description": "'current', 'agy', 'claude', or 'codex'"},
+                "prompt": {"type": "string", "description": "Custom instructions (optional)"},
             },
         },
     },
     {
         "name": "bridge_send_to_claude",
-        "description": "Send a message directly into an already open Claude Desktop / CLI tab via its live Unix socket (/tmp/cc-socks/<pid>.sock).",
+        "description": "Send message to open Claude Desktop/CLI tab via Unix socket.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "target": {"type": "string", "description": "Project path, project name, session title, or PID"},
-                "message": {"type": "string", "description": "Message to inject into the open Claude tab"},
+                "target": {"type": "string", "description": "Project path/name, title, or PID"},
+                "message": {"type": "string", "description": "Message text"},
             },
             "required": ["target", "message"],
         },
     },
     {
         "name": "bridge_spawn_agy_chat",
-        "description": "Create/register a project in Antigravity 2.0 (Turbo mode) and start/focus a new live chat tab.",
+        "description": "Register project in Antigravity 2.0 (Turbo) and spawn/focus new chat.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "project": {"type": "string", "description": "Project path or name"},
-                "prompt": {"type": "string", "description": "Initial prompt for the Antigravity chat"},
+                "project": {"type": "string", "description": "Project path/name"},
+                "prompt": {"type": "string", "description": "Initial prompt"},
             },
             "required": ["project", "prompt"],
         },
     },
     {
         "name": "bridge_record_decision",
-        "description": "Record an architectural decision or rejected dead-end ('tried X, failed because Y') in the shared SQLite WAL database so other IDEs do not repeat mistakes.",
+        "description": "Record architectural decision or rejected dead_end in shared SQLite WAL.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "project": {"type": "string", "description": "Optional project path or name"},
-                "kind": {"type": "string", "enum": ["decision", "dead_end"], "description": "'decision' or 'dead_end'"},
-                "summary": {"type": "string", "description": "What was decided or what approach failed"},
-                "reason": {"type": "string", "description": "Why this choice was made or why the approach failed"},
+                "project": {"type": "string", "description": "Project path/name (optional)"},
+                "kind": {"type": "string", "enum": ["decision", "dead_end"]},
+                "summary": {"type": "string", "description": "Decision or failed approach"},
+                "reason": {"type": "string", "description": "Why"},
             },
             "required": ["summary"],
         },
     },
     {
         "name": "bridge_search_history",
-        "description": "Full-text search (SQLite FTS5) across all unabridged session transcripts of the project across Claude, Antigravity, Codex, and WorkBuddy.",
+        "description": "FTS5 search across all session transcripts of the project.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Search query or keyword"},
-                "project": {"type": "string", "description": "Optional project path or name"},
+                "query": {"type": "string", "description": "Keyword/phrase"},
+                "project": {"type": "string", "description": "Project path/name (optional)"},
             },
             "required": ["query"],
         },
