@@ -439,17 +439,30 @@ def find_worktrees_for_repo(repo_path: Path) -> List[Path]:
 
 
 def _workspace_activity_mtime(p: Path) -> float:
-    """Returns the latest activity timestamp for a repo/worktree across Claude sessions, git index, and docs."""
+    """Returns the latest activity timestamp for a repo/worktree across uncommitted files, Claude sessions, git index, and docs."""
     best = 0.0
     if not p.exists():
         return best
     for fn in ("CLAUDE.md", "AGENTS.md", ".git/index", ".git/HEAD"):
         f = p / fn
-        if f.exists():
+        if f.exists() and f.is_file():
             try:
                 best = max(best, f.stat().st_mtime)
             except Exception:
                 pass
+    try:
+        rc, st_out, _ = run_git(p, ["status", "--porcelain"])
+        if rc == 0 and st_out:
+            for ln in st_out.splitlines()[:15]:
+                if len(ln) > 3:
+                    rel_f = ln[3:].strip().strip('"')
+                    if " -> " in rel_f:
+                        rel_f = rel_f.split(" -> ")[-1]
+                    fp = p / rel_f
+                    if fp.exists():
+                        best = max(best, fp.stat().st_mtime)
+    except Exception:
+        pass
     slug = "-" + re.sub(r"[^a-zA-Z0-9]", "-", str(p.resolve()).lstrip("/"))
     slug_dir = CLAUDE_PROJECTS_DIR / slug
     if slug_dir.exists():
@@ -815,6 +828,12 @@ def list_agy_projects() -> List[Dict[str, Any]]:
     return disk_list
 
 
+def is_ephemeral_temp_dir(p: Path) -> bool:
+    """Returns True if path is inside /tmp or macOS /var/folders temporary directories."""
+    s = str(p.expanduser().resolve())
+    return s.startswith(("/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/"))
+
+
 def register_or_update_agy_project(
     project_name: str,
     git_paths: List[Path],
@@ -823,7 +842,14 @@ def register_or_update_agy_project(
     """
     Registers or updates a project in Antigravity with full Turbo/Allow/Eager settings
     and all associated gitFolder.folderUri URIs (both worktree and base repo).
+    Never registers ephemeral /tmp or /var/folders test directories into Antigravity.
     """
+    if git_paths and all(is_ephemeral_temp_dir(p) for p in git_paths):
+        return {
+            "id": preferred_id or "ephemeral-test-project",
+            "name": project_name,
+            "projectResources": {"resources": [{"gitFolder": {"folderUri": path_to_uri(p)}} for p in git_paths]},
+        }
     existing_projects = list_agy_projects()
     target_uris = [path_to_uri(p) for p in git_paths]
     matched_proj: Optional[Dict[str, Any]] = None
@@ -987,7 +1013,7 @@ def focus_agy_conversation(cascade_id: str, project_id: Optional[str] = None) ->
 def register_in_codex(paths: List[Path]) -> bool:
     """Registers project path(s) in ~/.codex/.codex-global-state.json and ~/.codex/state_5.sqlite."""
     updated = False
-    resolved_strs = [str(p.expanduser().resolve()) for p in paths if p.exists()]
+    resolved_strs = [str(p.expanduser().resolve()) for p in paths if p.exists() and not is_ephemeral_temp_dir(p)]
     if not resolved_strs:
         return False
 
@@ -1078,7 +1104,7 @@ def list_codex_sessions(limit: int = 10) -> Dict[str, Any]:
 
 def register_in_claude_presets(project_path: Path, project_name: Optional[str] = None) -> bool:
     """Registers project folder in ~/Library/Application Support/Claude/ccd-session-presets.json."""
-    if not CLAUDE_APP_SUPPORT.exists():
+    if not CLAUDE_APP_SUPPORT.exists() or is_ephemeral_temp_dir(project_path):
         return False
     data: Dict[str, Any] = {"version": 1, "byAccount": {}}
     if CLAUDE_PRESETS_FILE.exists():
@@ -1514,7 +1540,7 @@ def extract_claude_message_text(
     return ""
 
 
-BASE64_BLOB_RE = re.compile(r'"data"\s*:\s*"[A-Za-z0-9+/=]{256,}"')
+BASE64_BLOB_RE = re.compile(r'(\\?"data\\?"\s*:\s*\\?")[A-Za-z0-9+/=]{256,}(\\?")')
 PARSE_CACHE_DIR = Path(f"/tmp/agy-bridge-cache-{os.getuid()}")
 
 
@@ -1569,7 +1595,7 @@ def parse_claude_or_workbuddy_jsonl(jsonl_path: Path, max_turns: int = 0) -> Dic
                 if not line:
                     continue
                 if len(line) > 16384 and "base64" in line:
-                    line = BASE64_BLOB_RE.sub('"data":"[BASE64_IMAGE_OMITTED]"', line)
+                    line = BASE64_BLOB_RE.sub(r'\1[BASE64_IMAGE_OMITTED]\2', line)
                 try:
                     rec = json.loads(line)
                 except Exception:
@@ -4503,8 +4529,10 @@ def cmd_mcp(args: argparse.Namespace) -> int:
                     "id": req_id,
                     "result": {"isError": True, "content": [{"type": "text", "text": str(exc)}]},
                 }
+        elif method in ("resources/list", "prompts/list"):
+            resp_obj = {"jsonrpc": "2.0", "id": req_id, "result": {method.split("/")[0]: []}}
         elif req_id is not None:
-            resp_obj = {"jsonrpc": "2.0", "id": req_id, "result": {}}
+            resp_obj = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
 
         if resp_obj is not None:
             out_str = json.dumps(resp_obj, ensure_ascii=False)
