@@ -924,10 +924,19 @@ def register_or_update_agy_project(
     return project_obj
 
 
-def list_agy_conversations(project_id: Optional[str] = None, workspace_path: Optional[Path] = None, top_level_only: bool = True) -> List[Dict[str, Any]]:
+def list_agy_conversations(
+    project_id: Optional[str] = None,
+    workspace_path: Optional[Path] = None,
+    top_level_only: bool = True,
+    extra_workspace_paths: Optional[List[Path]] = None,
+) -> List[Dict[str, Any]]:
     """Lists Antigravity conversations via GetAllCascadeTrajectories with fallback to disk."""
     results: List[Dict[str, Any]] = []
-    ws_uri = path_to_uri(workspace_path) if workspace_path else None
+    ws_uris_set = set()
+    if workspace_path:
+        ws_uris_set.add(path_to_uri(workspace_path))
+    for ep in extra_workspace_paths or []:
+        ws_uris_set.add(path_to_uri(ep))
 
     ok, resp = agy_rpc("GetAllCascadeTrajectories", {})
     if ok and "trajectorySummaries" in resp:
@@ -941,10 +950,10 @@ def list_agy_conversations(project_id: Optional[str] = None, workspace_path: Opt
             w_uris = meta.get("workspaceUris", []) or [
                 w.get("workspaceFolderAbsoluteUri", "") for w in meta.get("workspaces", [])
             ]
-            if project_id and pid != project_id:
-                if not (ws_uri and ws_uri in w_uris):
+            if project_id:
+                if pid != project_id and not (ws_uris_set and any(u in w_uris for u in ws_uris_set)):
                     continue
-            elif ws_uri and ws_uri not in w_uris:
+            elif ws_uris_set and not any(u in w_uris for u in ws_uris_set):
                 continue
             results.append({
                 "cascadeId": cid,
@@ -2040,11 +2049,14 @@ def select_representative_sessions(all_parsed_sessions: List[Dict[str, Any]], ma
     seen_ids = set()
     seen_agents = set()
 
+    def _turn_count(s: Dict[str, Any]) -> int:
+        return int(s.get("totalTurns") or len(s.get("allTurns") or s.get("turns") or []))
+
     sorted_all = sorted(all_parsed_sessions, key=lambda s: s.get("mtime", 0), reverse=True)
     for s in sorted_all:
         ag = s.get("agent", "")
         sid = s.get("sessionId", "")
-        if ag and ag not in seen_agents and s.get("totalTurns", 0) > 0:
+        if ag and ag not in seen_agents and _turn_count(s) > 0:
             seen_agents.add(ag)
             seen_ids.add(sid)
             selected.append(s)
@@ -2053,7 +2065,7 @@ def select_representative_sessions(all_parsed_sessions: List[Dict[str, Any]], ma
         if len(selected) >= max_sessions:
             break
         sid = s.get("sessionId", "")
-        if sid not in seen_ids and s.get("totalTurns", 0) > 0:
+        if sid not in seen_ids and _turn_count(s) > 0:
             seen_ids.add(sid)
             selected.append(s)
 
@@ -2380,11 +2392,14 @@ def write_full_session_mirrors(
 
 def extract_clean_progress_text(raw_turn_text: str, max_chars: int = 380) -> str:
     """
-    Strips raw `[Thinking / Reasoning]`, `[Tool Call]`, `[Tool Result]`, and `<system-reminder>` noise from a turn
-    so Layer 1 (CLAUDE.md / AGENTS.md) stays a crisp, ~400-token Progress State that doesn't burn rate limits,
+    Strips raw `[Thinking / Reasoning]`, `[Tool Call]`, `[Tool Result]`, `<system-reminder>`,
+    `<artifact-view-context>`, and `<pasted_content>` wrapper tags from a turn
+    so Layer 1 (LIVE_STATE.md) stays a crisp, ~400-token Progress State that doesn't burn rate limits,
     while full reasoning and tool outputs remain on disk in HANDOFF_CONTEXT.md and .agy-bridge/sessions/.
     """
     cleaned_raw = re.sub(r"<system-reminder>.*?</system-reminder>", "", raw_turn_text or "", flags=re.DOTALL)
+    cleaned_raw = re.sub(r"<artifact-view-context[^>]*>.*?</artifact-view-context>", "", cleaned_raw, flags=re.DOTALL)
+    cleaned_raw = re.sub(r"</?pasted_content[^>]*>", "", cleaned_raw)
     clean_lines: List[str] = []
     tool_names: List[str] = []
     for line in cleaned_raw.splitlines():
@@ -2523,10 +2538,18 @@ def build_auto_state_block(
     lines.append("```")
     lines.append("")
 
-    # Section: Clean Progress Summary per Active Agent (No raw Thinking/Tool spam)
+    # Section: Clean Progress Summary per Active Agent (1 latest session per unique IDE so LIVE_STATE stays ~400 tokens)
     if rep_sessions:
         lines.append(f"### {sec_num}. Latest Progress Snapshot (Per Active IDE)")
-        for s_idx, ps in enumerate(rep_sessions):
+        seen_snapshot_agents = set()
+        snapshot_sessions: List[Dict[str, Any]] = []
+        for rs in rep_sessions:
+            ag_name = rs.get("agent", "agent")
+            if ag_name not in seen_snapshot_agents:
+                seen_snapshot_agents.add(ag_name)
+                snapshot_sessions.append(rs)
+
+        for s_idx, ps in enumerate(snapshot_sessions):
             ag = ps.get("agent", "agent")
             sid = ps.get("sessionId", "")
             safe_sid = re.sub(r"[^a-zA-Z0-9_.-]", "_", sid)
@@ -2535,27 +2558,40 @@ def build_auto_state_block(
             if not all_turns:
                 continue
 
-            outcome_limit = 1500 if s_idx == 0 else 420
+            outcome_limit = 900 if s_idx == 0 else 550
             init_goal = extract_clean_progress_text(ps.get("initialUserGoal") or "", max_chars=260)
             assistant_outcomes: List[str] = []
             user_prompts: List[str] = []
             fallback_tool_assistant = ""
+            fallback_meta_user = ""
+            fallback_meta_assistant = ""
             for t in reversed(all_turns):
                 if t.get("role") == "assistant" and len(assistant_outcomes) < (2 if s_idx == 0 else 1):
                     cand = extract_clean_progress_text(t.get("text") or "", max_chars=outcome_limit)
                     if cand.startswith("*(Executed tools:"):
                         if not fallback_tool_assistant:
                             fallback_tool_assistant = cand
+                    elif is_meta_handoff_text(cand):
+                        if not fallback_meta_assistant:
+                            fallback_meta_assistant = cand
                     elif cand and cand != "No response requested." and cand not in assistant_outcomes:
                         assistant_outcomes.append(cand)
                 elif t.get("role") == "user" and len(user_prompts) < (2 if s_idx == 0 else 1):
                     ucand = extract_clean_progress_text(t.get("text") or "", max_chars=280)
-                    if ucand and ucand not in ("[Request interrupted by user]", "Try again") and ucand not in user_prompts:
+                    if is_meta_handoff_text(ucand):
+                        if not fallback_meta_user and ucand not in ("[Request interrupted by user]", "Try again"):
+                            fallback_meta_user = ucand
+                    elif ucand and ucand not in user_prompts:
                         user_prompts.append(ucand)
                 if len(assistant_outcomes) >= (2 if s_idx == 0 else 1) and len(user_prompts) >= (2 if s_idx == 0 else 1):
                     break
-            if not assistant_outcomes and fallback_tool_assistant:
-                assistant_outcomes.append(fallback_tool_assistant)
+            if not assistant_outcomes:
+                if fallback_tool_assistant:
+                    assistant_outcomes.append(fallback_tool_assistant)
+                elif fallback_meta_assistant:
+                    assistant_outcomes.append(fallback_meta_assistant)
+            if not user_prompts and fallback_meta_user:
+                user_prompts.append(fallback_meta_user)
 
             last_user = user_prompts[0] if user_prompts else ""
             last_assistant = assistant_outcomes[0] if assistant_outcomes else ""
@@ -2714,6 +2750,59 @@ def is_agy_exported_mirror(session_id: str) -> bool:
     return bool(session_id and (AGY_BRAIN_DIR / session_id).exists())
 
 
+META_HANDOFF_PATTERNS = (
+    "через mcp",
+    "продолжи за",
+    "продолжи в",
+    "продолжи задачу",
+    "перекинь в",
+    "перенеси в",
+    "continue from",
+    "continue task",
+    "switch to",
+    "handoff to",
+    "bridge_continue_task",
+    "bridge_spawn_agy_chat",
+    "запускаю сессию в antigravity",
+    "сессия в antigravity запущена",
+    "создал новый чат в antigravity",
+    "передал контекст",
+    "[request interrupted",
+    "try again",
+)
+
+
+def is_meta_handoff_text(text: str) -> bool:
+    """Returns True if a user prompt or assistant reply is purely a meta IDE handoff/failover instruction."""
+    if not text:
+        return True
+    low = text.strip().lower()
+    if len(low) > 360:
+        return False
+    return any(pat in low for pat in META_HANDOFF_PATTERNS)
+
+
+def path_matches_project(candidate_path_str: str, path_strs: List[str], project_name: str) -> bool:
+    """
+    Strictly matches a session path against known git repo/worktree paths or exact folder basename.
+    Prevents false-positive substring matches on short project names like 'any', 'app', or 'api'.
+    """
+    if not candidate_path_str:
+        return False
+    cand = candidate_path_str.rstrip("/")
+    for ps in path_strs:
+        ps_clean = ps.rstrip("/")
+        if cand == ps_clean or cand.startswith(ps_clean + "/"):
+            return True
+    try:
+        cand_path = Path(cand)
+        if cand_path.name.lower() == project_name.lower():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def discover_project_sessions(
     project_name: str,
     project_id: str,
@@ -2729,6 +2818,7 @@ def discover_project_sessions(
     seen_ids = set()
 
     path_strs = [str(p.resolve()) for p in all_git_paths if p.exists()]
+    valid_slugs = {path_to_claude_slug(p).lower() for p in all_git_paths}
     base_repo = all_git_paths[-1] if all_git_paths else Path.cwd()
 
     # 1. Check exact ~/.claude/projects/<slug>/*.jsonl directories for all_git_paths first
@@ -2764,11 +2854,17 @@ def discover_project_sessions(
             continue
         c_cwd = cs.get("cwd", "")
         c_wt = cs.get("worktreePath", "")
-        if any(ps in (c_cwd, c_wt) for ps in path_strs) or project_name.lower() in c_cwd.lower() or project_name.lower() in cs.get("jsonlPath", "").lower():
+        c_jsonl = cs.get("jsonlPath", "")
+        jsonl_slug = Path(c_jsonl).parent.name.lower() if c_jsonl else ""
+        if (
+            path_matches_project(c_cwd, path_strs, project_name)
+            or path_matches_project(c_wt, path_strs, project_name)
+            or jsonl_slug in valid_slugs
+        ):
             seen_ids.add(sid)
             parsed_cs: Optional[Dict[str, Any]] = None
-            if cs.get("jsonlPath") and Path(cs["jsonlPath"]).exists():
-                parsed_cs = parse_claude_or_workbuddy_jsonl(Path(cs["jsonlPath"]), max_turns=0)
+            if c_jsonl and Path(c_jsonl).exists():
+                parsed_cs = parse_claude_or_workbuddy_jsonl(Path(c_jsonl), max_turns=0)
                 if cs.get("title") and not parsed_cs.get("title"):
                     parsed_cs["title"] = cs["title"]
                 if cs.get("branch") and not parsed_cs.get("branch"):
@@ -2781,11 +2877,11 @@ def discover_project_sessions(
                 "lastModified": cs["lastModified"],
                 "mtime": cs.get("mtime", 0),
                 "totalTurns": (parsed_cs or {}).get("totalTurns", 0),
-                "jsonlPath": cs.get("jsonlPath", ""),
+                "jsonlPath": c_jsonl,
             })
 
     # 3. Antigravity conversations for this project (ALWAYS parse them even if Claude was also active!)
-    for ac in list_agy_conversations(project_id=project_id, workspace_path=base_repo)[:8]:
+    for ac in list_agy_conversations(project_id=project_id, workspace_path=base_repo, extra_workspace_paths=all_git_paths)[:8]:
         cid = ac["cascadeId"]
         if cid in seen_ids:
             continue
@@ -2810,7 +2906,8 @@ def discover_project_sessions(
         wid = wb["sessionId"]
         if wid in seen_ids:
             continue
-        if any(ps == wb.get("cwd") for ps in path_strs) or project_name.lower() in wb.get("projectSlug", "").lower():
+        wb_slug = (wb.get("projectSlug") or "").lower()
+        if path_matches_project(wb.get("cwd", ""), path_strs, project_name) or wb_slug in valid_slugs or wb_slug.endswith("-" + project_name.lower()):
             seen_ids.add(wid)
             parsed_wb: Optional[Dict[str, Any]] = None
             if wb.get("jsonlPath") and Path(wb["jsonlPath"]).exists():
@@ -2830,7 +2927,7 @@ def discover_project_sessions(
         tid = th["id"]
         if tid in seen_ids:
             continue
-        if any(ps == th.get("cwd") for ps in path_strs) or project_name.lower() in th.get("cwd", "").lower():
+        if path_matches_project(th.get("cwd", ""), path_strs, project_name):
             seen_ids.add(tid)
             parsed_cx: Optional[Dict[str, Any]] = None
             if th.get("rolloutPath") and Path(th["rolloutPath"]).exists():
@@ -3739,10 +3836,21 @@ def notify_macos(title: str, message: str) -> None:
         pass
 
 
-def find_most_recent_active_project() -> Path:
-    """Finds the most recently active project directory across Claude, Antigravity, Codex, and WorkBuddy."""
+def find_most_recent_active_project(prefer_recent_session: bool = False) -> Path:
+    """
+    Finds the most recently active project directory across Claude, Antigravity, Codex, and WorkBuddy.
+    When `prefer_recent_session=True` (used by long-lived MCP stdio daemons whose `os.getcwd()` is fixed at IDE startup),
+    prioritizes explicit env vars (`CLAUDE_PROJECT_DIR`, `AGY_WORKSPACE`) or the most recently modified live IDE session.
+    """
+    for env_key in ("CLAUDE_PROJECT_DIR", "AGY_WORKSPACE"):
+        env_val = os.environ.get(env_key, "").strip()
+        if env_val:
+            ep = Path(env_val).expanduser().resolve()
+            if ep.exists() and not is_non_project_dir(ep):
+                return ep
+
     cwd = Path.cwd().resolve()
-    if not is_non_project_dir(cwd) and (cwd / ".git").exists():
+    if not prefer_recent_session and not is_non_project_dir(cwd) and (cwd / ".git").exists():
         return cwd
 
     candidates: List[Tuple[float, Path]] = []
@@ -3764,7 +3872,40 @@ def find_most_recent_active_project() -> Path:
     if candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[0][1]
+    if not is_non_project_dir(cwd) and (cwd / ".git").exists():
+        return cwd
     return DEFAULT_DOCS_DIR / "agy-bridge"
+
+
+def select_best_failover_session(
+    all_parsed: List[Dict[str, Any]],
+    to_agent: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Selects the best source session to continue from `all_parsed` (sorted newest-first):
+      - Skips brand-new 1-2 turn sessions whose initial goal is a meta-handoff prompt (e.g. 'продолжи за клодом' in the current IDE).
+      - When `to_agent` is explicitly given ('agy' or 'claude'), prefers a substantive session from another agent if the newest session is a tiny stub in `to_agent`.
+    """
+    if not all_parsed:
+        return None
+    target_norm = (to_agent or "").lower().strip()
+    if target_norm in ("agy", "antigravity"):
+        target_norm = "antigravity"
+    elif target_norm in ("claude", "claude-code", "claude-desktop"):
+        target_norm = "claude"
+
+    for s in all_parsed:
+        turns = s.get("allTurns") or s.get("turns") or []
+        user_turns = [t for t in turns if t.get("role") == "user"]
+        goal_txt = extract_clean_progress_text(s.get("initialUserGoal") or "", max_chars=300)
+        # Skip 1-turn meta handoff stub sessions (e.g. user opened new IDE tab and typed 'continue from claude')
+        if len(user_turns) <= 1 and is_meta_handoff_text(goal_txt) and len(all_parsed) > 1:
+            continue
+        # If explicitly failing over to target_norm, skip a <=1 user-turn stub that already belongs to target_norm
+        if target_norm in ("antigravity", "claude") and s.get("agent") == target_norm and len(user_turns) <= 1 and len(all_parsed) > 1:
+            continue
+        return s
+    return all_parsed[0]
 
 
 def execute_continue_failover(
@@ -3777,7 +3918,7 @@ def execute_continue_failover(
     """
     Core 1-step failover engine (`agy-bridge continue` / `switch` / MCP `bridge_continue_task`):
       1. Resolves the target project (or auto-discovers the most recently active project on macOS)
-      2. Syncs all sessions and finds the latest session (e.g. an interrupted Claude session)
+      2. Syncs all sessions and finds the latest substantive session (skipping 1-turn meta-handoff stubs)
       3. Chooses the target IDE automatically if not specified (e.g. Claude -> Antigravity, Antigravity -> Claude)
       4. Builds a crisp recovery prompt (`Goal` + `Last Prompt` + `Last Outcome` + `Modified Files` + `HEAD`)
       5. Spawns or messages the target agent and returns the structured recovery bundle.
@@ -3804,7 +3945,7 @@ def execute_continue_failover(
         project_name, base_repo, active_ws, all_git_paths, project_id, write_tracked_docs=False
     )
 
-    latest_session = all_parsed[0] if all_parsed else None
+    latest_session = select_best_failover_session(all_parsed, to_agent=to_agent)
     source_agent = (latest_session or {}).get("agent", "claude")
     source_sid = (latest_session or {}).get("sessionId", "none")
 
@@ -3822,15 +3963,31 @@ def execute_continue_failover(
     init_goal = extract_clean_progress_text((latest_session or {}).get("initialUserGoal") or "", max_chars=350)
     last_user = ""
     last_assistant = ""
+    fallback_meta_u = ""
+    fallback_meta_a = ""
     for t in reversed(all_turns):
         if not last_assistant and t.get("role") == "assistant":
             cand = extract_clean_progress_text(t.get("text") or "", max_chars=500)
             if cand and not cand.startswith("*(Executed tools:"):
-                last_assistant = cand
+                if is_meta_handoff_text(cand):
+                    if not fallback_meta_a:
+                        fallback_meta_a = cand
+                else:
+                    last_assistant = cand
         elif not last_user and t.get("role") == "user":
-            last_user = extract_clean_progress_text(t.get("text") or "", max_chars=350)
+            ucand = extract_clean_progress_text(t.get("text") or "", max_chars=350)
+            if ucand:
+                if is_meta_handoff_text(ucand):
+                    if not fallback_meta_u:
+                        fallback_meta_u = ucand
+                else:
+                    last_user = ucand
         if last_user and last_assistant:
             break
+    if not last_user and fallback_meta_u:
+        last_user = fallback_meta_u
+    if not last_assistant and fallback_meta_a:
+        last_assistant = fallback_meta_a
 
     mfiles = (latest_session or {}).get("modifiedFiles") or []
     _, status_out, _ = run_git(active_ws, ["status", "-s"])
@@ -4197,10 +4354,8 @@ def cmd_install_hooks(args: argparse.Namespace) -> int:
         "command": agy_bridge_bin,
         "args": ["mcp"],
     }
-    atomic_write_text(
-        plugin_dir / "mcp_config.json",
-        json.dumps({"mcpServers": {"agy_bridge": mcp_entry}}, indent=2, ensure_ascii=False) + "\n",
-    )
+    # Remove duplicate plugin-level mcp_config.json if present so Antigravity doesn't load both `agy-bridge_agy_bridge` and `agy_bridge`
+    (plugin_dir / "mcp_config.json").unlink(missing_ok=True)
 
     global_rule_md = (
         "# Global Rule: `agy-bridge v0.3` Zero-Terminal Cross-Agent Context Bus\n\n"
@@ -4263,7 +4418,7 @@ def cmd_install_hooks(args: argparse.Namespace) -> int:
 
     print("[agy-bridge v0.3] Installed Zero-Terminal Hooks + MCP Server Across All IDEs:")
     print(f"  1. Claude Hooks & Inbound : {CLAUDE_SETTINGS_FILE} (SessionStart, UserPromptSubmit, PostToolUse, Stop, StopFailure)")
-    print(f"  2. Antigravity Plugin     : {plugin_dir} (SessionStart, PreInvocation, PostToolUse, Stop + MCP + Rules)")
+    print(f"  2. Antigravity Plugin     : {plugin_dir} (SessionStart, PreInvocation, PostToolUse, Stop + Rules)")
     print(f"  3. MCP Server Registered  : Antigravity (`mcp_config.json`), Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`)")
     print(f"  4. Short CLI Alias        : {ab_alias} -> {agy_bridge_bin}")
     return 0
@@ -4289,7 +4444,18 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     if plugin_dir.exists():
         shutil.rmtree(plugin_dir, ignore_errors=True)
 
-    print("[agy-bridge] Cleanly uninstalled global hooks and plugin.")
+    for mcp_file in (GEMINI_DIR / "config" / "mcp_config.json", HOME / ".claude.json"):
+        if mcp_file.exists():
+            try:
+                mj = json.loads(mcp_file.read_text(encoding="utf-8"))
+                ms = mj.get("mcpServers")
+                if isinstance(ms, dict) and "agy_bridge" in ms:
+                    del ms["agy_bridge"]
+                    atomic_write_text(mcp_file, json.dumps(mj, indent=2, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+
+    print("[agy-bridge] Cleanly uninstalled global hooks, plugin, and MCP entries.")
     return 0
 
 
@@ -4302,7 +4468,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         txt = CLAUDE_SETTINGS_FILE.read_text(encoding="utf-8", errors="replace")
         claude_hooks_ok = "StopFailure" in txt and "SessionStart" in txt
     agy_plugin_ok = (AGY_PLUGINS_DIR / "agy-bridge" / "hooks.json").exists()
-    agy_mcp_ok = (AGY_PLUGINS_DIR / "agy-bridge" / "mcp_config.json").exists()
+    agy_mcp_file = GEMINI_DIR / "config" / "mcp_config.json"
+    agy_mcp_ok = agy_mcp_file.exists() and "agy_bridge" in agy_mcp_file.read_text(encoding="utf-8", errors="replace")
     codex_mcp_ok = (CODEX_DIR / "config.toml").exists() and "agy_bridge" in (CODEX_DIR / "config.toml").read_text(encoding="utf-8", errors="replace")
 
     print("======================================================================")
@@ -4398,8 +4565,19 @@ MCP_TOOLS_SCHEMA = [
 
 
 def handle_mcp_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    if name == "bridge_send_to_claude":
+        target_arg = arguments.get("target") or arguments.get("project")
+        if not target_arg:
+            target_arg = str(find_most_recent_active_project(prefer_recent_session=True))
+        rc, info, err = send_claude_socket_message(str(target_arg), str(arguments.get("message", "")))
+        return {"content": [{"type": "text", "text": json.dumps({"returnCode": rc, "target": info, "error": err}, indent=2, ensure_ascii=False)}]}
+
     proj_arg = arguments.get("project")
-    raw_path = resolve_project_input(proj_arg)[0] if proj_arg else find_most_recent_active_project()
+    raw_path = resolve_project_input(proj_arg)[0] if proj_arg else find_most_recent_active_project(prefer_recent_session=True)
+    if name == "bridge_spawn_agy_chat" and proj_arg and not raw_path.exists():
+        raw_path.mkdir(parents=True, exist_ok=True)
+        ensure_git_repo(raw_path, init_commit=True)
+
     base_repo, active_ws, all_git_paths = resolve_repo_and_worktree(raw_path)
 
     if name == "bridge_get_state":
@@ -4421,28 +4599,9 @@ def handle_mcp_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]
         )
         return {"content": [{"type": "text", "text": json.dumps(res, indent=2, ensure_ascii=False)}]}
 
-    if name == "bridge_send_to_claude":
-        rc, info, err = send_claude_socket_message(str(arguments.get("target", active_ws)), str(arguments.get("message", "")))
-        return {"content": [{"type": "text", "text": json.dumps({"returnCode": rc, "target": info, "error": err}, indent=2, ensure_ascii=False)}]}
-
     if name == "bridge_spawn_agy_chat":
-        ns = argparse.Namespace(
-            path_or_name=arguments.get("project"),
-            positional_prompt=arguments.get("prompt"),
-            workspace=None,
-            name=None,
-            prompt=arguments.get("prompt"),
-            title=None,
-            model=None,
-            project_id=None,
-            from_claude=None,
-            focus=True,
-            no_chat=False,
-            timeout=30,
-            json=True,
-        )
         res = execute_continue_failover(
-            target_project=arguments.get("project"),
+            target_project=str(active_ws),
             to_agent="agy",
             custom_prompt=arguments.get("prompt"),
             focus=True,

@@ -276,12 +276,14 @@ class TestAgyBridgeV03(unittest.TestCase):
         self.assertNotIn(fake_b64[:512], full_dump)
         self.assertIn("[BASE64_IMAGE_OMITTED]", full_dump)
 
-        # Verify build_auto_state_block includes both Prev Outcome (the coding step) and Last Outcome (the handoff step)
+        # Verify build_auto_state_block skips meta-handoff noise ("через mcp создай в антигравити")
+        # and surfaces the real technical prompt and outcome!
         block = ab.build_auto_state_block("parser-repo", repo, "test-id", [p1], [])
         self.assertIn("src/app.py", block)
-        self.assertIn("Prev Outcome", block)
         self.assertIn("Added SeedShopService with 2-minute restock timer", block)
-        self.assertIn("Last Prompt**: через mcp создай в антигравити", block)
+        self.assertIn("Last Prompt**: Implement SeedShopService rotation", block)
+        self.assertNotIn("через mcp создай в антигравити", block)
+        self.assertNotIn("Создал новый чат в Antigravity", block)
 
     def test_06_hook_lifecycle_and_delta_cursor(self) -> None:
         repo = self.tmp_dir / "hook-repo"
@@ -429,6 +431,133 @@ class TestAgyBridgeV03(unittest.TestCase):
         self.assertIn("antigravity", st_data)
         self.assertIn("claude", st_data)
         self.assertIn("codex", st_data)
+
+    def test_09_failover_skips_meta_handoff_stub_and_preserves_technical_outcome(self) -> None:
+        claude_session = {
+            "agent": "claude",
+            "sessionId": "claude-substantive-1111",
+            "title": "Build PlotService & Shop UI",
+            "mtime": 1700000100.0,
+            "initialUserGoal": "Build PlotService and SeedShop UI in Roblox",
+            "modifiedFiles": ["src/server/PlotService.luau", "src/client/ShopUI.luau"],
+            "allTurns": [
+                {"role": "user", "text": "Build PlotService and SeedShop UI in Roblox"},
+                {"role": "assistant", "text": "Created PlotService.luau with 6 plots."},
+                {"role": "user", "text": "Now add remote events for buying seeds and restock timer"},
+                {"role": "assistant", "text": "Implemented BuySeedRemote and 120s restock loop in SeedShopService.luau."},
+                {"role": "user", "text": "через mcp создай в антигравити"},
+                {"role": "assistant", "text": "Запускаю сессию в Antigravity через MCP..."},
+            ],
+        }
+        agy_meta_stub = {
+            "agent": "antigravity",
+            "sessionId": "agy-stub-2222",
+            "title": "Continue task",
+            "mtime": 1700000200.0,
+            "initialUserGoal": "продолжи задачу за клодом",
+            "modifiedFiles": [],
+            "allTurns": [
+                {"role": "user", "text": "продолжи задачу за клодом"},
+            ],
+        }
+        all_parsed = [agy_meta_stub, claude_session]
+        chosen = ab.select_best_failover_session(all_parsed, to_agent="current")
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen["sessionId"], "claude-substantive-1111")
+
+        chosen_agy = ab.select_best_failover_session(all_parsed, to_agent="agy")
+        self.assertEqual(chosen_agy["sessionId"], "claude-substantive-1111")
+
+        repo = self.tmp_dir / "failover-repo"
+        self._init_git_repo(repo)
+        # Also test stripping of <artifact-view-context> and <pasted_content> from Claude Desktop prompts
+        claude_session["allTurns"][2]["text"] = (
+            '<artifact-view-context artifact="d16a7846">\n{"context":{"mode":"edit"}}\n</artifact-view-context>\n'
+            '<pasted_content id="6b0f">\nNow add remote events for buying seeds and restock timer\n</pasted_content id="6b0f">'
+        )
+        state_md = ab.build_auto_state_block("failover-repo", repo, "test-id", [claude_session], [])
+        self.assertIn("Now add remote events for buying seeds and restock timer", state_md)
+        self.assertIn("Implemented BuySeedRemote and 120s restock loop", state_md)
+        self.assertNotIn("artifact-view-context", state_md)
+        self.assertNotIn("pasted_content", state_md)
+        self.assertNotIn("через mcp создай в антигравити", state_md)
+
+    def test_10_strict_project_path_matching_no_substring_collision(self) -> None:
+        path_strs = ["/Users/test/Documents/any", "/Users/test/.claude/worktrees/any-wt1"]
+        self.assertTrue(ab.path_matches_project("/Users/test/Documents/any", path_strs, "any"))
+        self.assertTrue(ab.path_matches_project("/Users/test/Documents/any/src/main.py", path_strs, "any"))
+        self.assertTrue(ab.path_matches_project("/Users/test/.claude/worktrees/any-wt1", path_strs, "any"))
+        self.assertFalse(ab.path_matches_project("/Users/test/Documents/company-bot", path_strs, "any"))
+        self.assertFalse(ab.path_matches_project("/Users/test/Documents/many-scripts", path_strs, "any"))
+        self.assertFalse(ab.path_matches_project("/Users/test/Documents/anybody", path_strs, "any"))
+
+    def test_11_agy_conversation_filter_preserves_project_id_matches(self) -> None:
+        base_repo = self.tmp_dir / "wt-main"
+        wt_repo = self.tmp_dir / "wt-secondary"
+        base_repo.mkdir(parents=True, exist_ok=True)
+        wt_repo.mkdir(parents=True, exist_ok=True)
+
+        orig_rpc = ab.agy_rpc
+        try:
+            ab.agy_rpc = lambda method, payload, timeout=10: (
+                True,
+                {
+                    "trajectorySummaries": {
+                        "cid-empty-uris": {
+                            "summary": "Newly spawned cascade",
+                            "stepCount": 2,
+                            "status": "IDLE",
+                            "lastModifiedTime": "2026-11-07T12:00:00Z",
+                            "trajectoryMetadata": {"projectId": "proj-123", "workspaceUris": []},
+                        },
+                        "cid-worktree-uri": {
+                            "summary": "Worktree cascade",
+                            "stepCount": 15,
+                            "status": "IDLE",
+                            "lastModifiedTime": "2026-11-07T12:05:00Z",
+                            "trajectoryMetadata": {
+                                "projectId": "proj-123",
+                                "workspaceUris": [ab.path_to_uri(wt_repo)],
+                            },
+                        },
+                        "cid-other-project": {
+                            "summary": "Unrelated project",
+                            "stepCount": 9,
+                            "status": "IDLE",
+                            "lastModifiedTime": "2026-11-07T12:10:00Z",
+                            "trajectoryMetadata": {
+                                "projectId": "proj-999",
+                                "workspaceUris": ["file:///Users/test/other"],
+                            },
+                        },
+                    }
+                },
+            )
+            convs = ab.list_agy_conversations(
+                project_id="proj-123",
+                workspace_path=base_repo,
+                extra_workspace_paths=[base_repo, wt_repo],
+            )
+            cids = [c["cascadeId"] for c in convs]
+            self.assertIn("cid-empty-uris", cids)
+            self.assertIn("cid-worktree-uri", cids)
+            self.assertNotIn("cid-other-project", cids)
+        finally:
+            ab.agy_rpc = orig_rpc
+
+    def test_12_mcp_project_discovery_honors_env_and_recent_sessions(self) -> None:
+        env_repo = self.tmp_dir / "env-override-repo"
+        self._init_git_repo(env_repo)
+        old_env = os.environ.get("CLAUDE_PROJECT_DIR")
+        try:
+            os.environ["CLAUDE_PROJECT_DIR"] = str(env_repo)
+            found = ab.find_most_recent_active_project(prefer_recent_session=True)
+            self.assertEqual(found, env_repo.resolve())
+        finally:
+            if old_env is None:
+                os.environ.pop("CLAUDE_PROJECT_DIR", None)
+            else:
+                os.environ["CLAUDE_PROJECT_DIR"] = old_env
 
 
 if __name__ == "__main__":
