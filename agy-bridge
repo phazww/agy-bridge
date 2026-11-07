@@ -4665,11 +4665,11 @@ def cmd_mcp(args: argparse.Namespace) -> int:
                 "id": req_id,
                 "result": {
                     "protocolVersion": client_proto,
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
                     "serverInfo": {"name": "agy-bridge-mcp", "version": "0.3.0"},
                 },
             }
-        elif method == "notifications/initialized":
+        elif method.startswith("notifications/"):
             resp_obj = None
         elif method == "ping":
             resp_obj = {"jsonrpc": "2.0", "id": req_id, "result": {}}
@@ -4690,6 +4690,8 @@ def cmd_mcp(args: argparse.Namespace) -> int:
                 }
         elif method in ("resources/list", "prompts/list"):
             resp_obj = {"jsonrpc": "2.0", "id": req_id, "result": {method.split("/")[0]: []}}
+        elif method == "resources/templates/list":
+            resp_obj = {"jsonrpc": "2.0", "id": req_id, "result": {"resourceTemplates": []}}
         elif req_id is not None:
             resp_obj = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
 
