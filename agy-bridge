@@ -2491,7 +2491,7 @@ IGNORED_DEV_SERVER_PROCS = (
 )
 
 
-def discover_project_dev_servers(all_git_paths: List[Path]) -> List[Dict[str, Any]]:
+def _discover_lsof_dev_servers(all_git_paths: List[Path]) -> List[Dict[str, Any]]:
     """
     Fast (<40ms) auto-detection of running local dev servers / listening TCP ports
     bound to the repository or any of its git worktrees (via process `cwd` or command line).
@@ -2639,6 +2639,262 @@ def discover_project_dev_servers(all_git_paths: List[Path]) -> List[Dict[str, An
     return results
 
 
+DOCKER_PS_TIMEOUT_SEC = 0.7
+DOCKER_COMPOSE_PS_FORMAT = "\t".join([
+    "{{.ID}}",
+    "{{.Names}}",
+    "{{.Ports}}",
+    '{{.Label "com.docker.compose.project"}}',
+    '{{.Label "com.docker.compose.project.working_dir"}}',
+    '{{.Label "com.docker.compose.service"}}',
+])
+_DOCKER_PORT_RE = re.compile(
+    r"(?:(?P<host_ip>[0-9.]+|\[[0-9a-fA-F:]*\]|::|[0-9a-fA-F:]*?):)?"
+    r"(?P<host>\d+)(?:-(?P<host_end>\d+))?->(?P<cont>\d+)(?:-(?P<cont_end>\d+))?/(?P<proto>tcp|udp)"
+)
+
+
+def _path_prefixes(all_git_paths: List[Path]) -> List[Tuple[str, Path]]:
+    """(prefix_string, worktree_root) pairs; both raw and resolved spellings (macOS /private/var etc.)."""
+    out: List[Tuple[str, Path]] = []
+    for p in all_git_paths:
+        if not p.exists():
+            continue
+        for cand in (str(p), str(p.resolve())):
+            c = cand.rstrip("/")
+            if c and all(c != e[0] for e in out):
+                out.append((c, p))
+    return out
+
+
+def match_worktree_for_path(path_val: str, all_git_paths: List[Path], args_val: str = "") -> Optional[Path]:
+    """
+    Map a cwd / compose working_dir to the git worktree that owns it.
+    Uses the LONGEST matching prefix, so a worktree nested inside the base repo
+    (e.g. `<repo>/.claude/worktrees/feat`) wins over the base repo itself.
+    Falls back to a path mentioned in the command line (`args_val`).
+    """
+    prefixes = _path_prefixes(all_git_paths)
+    cands: List[str] = []
+    if path_val:
+        cands.append(path_val.rstrip("/"))
+        try:
+            rc = str(Path(path_val).resolve()).rstrip("/")
+            if rc not in cands:
+                cands.append(rc)
+        except Exception:
+            pass
+    best: Optional[Tuple[int, Path]] = None
+    for c in cands:
+        for pref, wt in prefixes:
+            if c == pref or c.startswith(pref + "/"):
+                if best is None or len(pref) > best[0]:
+                    best = (len(pref), wt)
+    if best is None and args_val:
+        for pref, wt in prefixes:
+            if pref in args_val and (best is None or len(pref) > best[0]):
+                best = (len(pref), wt)
+    return best[1] if best else None
+
+
+def parse_docker_host_ports(ports_field: str) -> List[int]:
+    """Parse `docker ps` Ports column (e.g. `0.0.0.0:5432->5432/tcp, :::5432->5432/tcp`) into published TCP host ports."""
+    found: List[int] = []
+    for m in _DOCKER_PORT_RE.finditer(ports_field or ""):
+        if m.group("proto") != "tcp":
+            continue
+        start = int(m.group("host"))
+        end = int(m.group("host_end") or start)
+        if end < start or end - start > 64:
+            end = start
+        for pt in range(start, end + 1):
+            if pt not in found:
+                found.append(pt)
+    return found
+
+
+def parse_docker_compose_ps(output: str, all_git_paths: List[Path]) -> List[Dict[str, Any]]:
+    """
+    Parse `docker ps --format DOCKER_COMPOSE_PS_FORMAT` output and keep only Compose containers
+    whose `com.docker.compose.project.working_dir` lies inside the repo or one of its worktrees.
+    On macOS the host port is held by `com.docker.backend`/`vpnkit`, so lsof cwd-matching can't see these.
+    """
+    results: List[Dict[str, Any]] = []
+    for line in (output or "").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 5:
+            continue
+        cid, name, ports_f, project, work_dir = (x.strip() for x in parts[:5])
+        service = parts[5].strip() if len(parts) > 5 else ""
+        if not work_dir:
+            continue
+        wt = match_worktree_for_path(work_dir, all_git_paths)
+        if wt is None:
+            continue
+        wd_name = Path(work_dir.rstrip("/")).name
+        default_name_clash = bool(project) and project == wd_name and Path(work_dir).resolve() != wt.resolve()
+        for pt in parse_docker_host_ports(ports_f):
+            results.append({
+                "port": pt,
+                "endpoint": f"localhost:{pt}",
+                "pid": 0,
+                "process": f"docker:{service or name}",
+                "command": f"docker compose -p {project} ({name})"[:120],
+                "cwd": work_dir,
+                "kind": "docker",
+                "container": name,
+                "container_id": cid[:12],
+                "compose_project": project,
+                "compose_service": service,
+                "compose_working_dir": work_dir,
+                "compose_default_name_risk": default_name_clash,
+                "worktree": str(wt),
+            })
+    return results
+
+
+def _find_docker_bin() -> Optional[str]:
+    cands = [
+        shutil.which("docker"),
+        "/usr/local/bin/docker",
+        "/opt/homebrew/bin/docker",
+        str(Path.home() / ".docker/bin/docker"),
+        str(Path.home() / ".orbstack/bin/docker"),
+        "/Applications/Docker.app/Contents/Resources/bin/docker",
+    ]
+    for c in cands:
+        if c and Path(c).exists():
+            return c
+    return None
+
+
+def _docker_daemon_likely_up() -> bool:
+    """Cheap socket-existence check so hooks never pay the docker CLI timeout when Docker is off."""
+    if os.environ.get("DOCKER_HOST"):
+        return True
+    socks = [
+        Path("/var/run/docker.sock"),
+        Path.home() / ".docker/run/docker.sock",
+        Path.home() / ".orbstack/run/docker.sock",
+        Path.home() / ".colima/default/docker.sock",
+        Path.home() / ".rd/docker.sock",
+    ]
+    for s in socks:
+        try:
+            if s.is_socket():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def discover_docker_compose_services(all_git_paths: List[Path]) -> List[Dict[str, Any]]:
+    if os.environ.get("AGY_BRIDGE_NO_DOCKER") == "1":
+        return []
+    if not _path_prefixes(all_git_paths):
+        return []
+    docker_bin = _find_docker_bin()
+    if not docker_bin or not _docker_daemon_likely_up():
+        return []
+    try:
+        r = subprocess.run(
+            [docker_bin, "ps", "--filter", "label=com.docker.compose.project", "--format", DOCKER_COMPOSE_PS_FORMAT],
+            capture_output=True,
+            text=True,
+            timeout=DOCKER_PS_TIMEOUT_SEC,
+        )
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    return parse_docker_compose_ps(r.stdout, all_git_paths)
+
+
+def discover_project_dev_servers(all_git_paths: List[Path]) -> List[Dict[str, Any]]:
+    """
+    Running dev servers bound to the repo or any of its git worktrees:
+    native listeners via lsof (cwd / args) + Docker Compose containers via labels.
+    Each entry carries `worktree` so agents know whether to REUSE it (same worktree)
+    or pick another host port / COMPOSE_PROJECT_NAME (neighbor worktree).
+    """
+    results: List[Dict[str, Any]] = []
+    try:
+        native = _discover_lsof_dev_servers(all_git_paths)
+    except Exception:
+        native = []
+    for s in native:
+        s.setdefault("kind", "native")
+        wt = match_worktree_for_path(s.get("cwd", ""), all_git_paths, s.get("command", ""))
+        s["worktree"] = str(wt) if wt else ""
+        results.append(s)
+    taken = {s["port"] for s in results}
+    try:
+        docker_srv = discover_docker_compose_services(all_git_paths)
+    except Exception:
+        docker_srv = []
+    for s in docker_srv:
+        if s["port"] in taken:
+            continue
+        taken.add(s["port"])
+        results.append(s)
+    results.sort(key=lambda x: (x["port"], x["pid"]))
+    return results
+
+
+def format_dev_server_label(s: Dict[str, Any]) -> str:
+    if s.get("kind") == "docker":
+        return f"`{s['endpoint']}` (`{s['process']}`, compose `{s.get('compose_project', '')}`)"
+    return f"`{s['endpoint']}` (`{s['process']}`, PID `{s['pid']}`)"
+
+
+def format_dev_servers_lines(servers: List[Dict[str, Any]], active_workspace: Optional[Path]) -> List[str]:
+    """LIVE_STATE lines grouped by owning worktree with explicit reuse / avoid guidance."""
+    if not servers:
+        return []
+    act = ""
+    if active_workspace is not None:
+        try:
+            act = str(active_workspace.resolve())
+        except Exception:
+            act = str(active_workspace)
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for s in servers:
+        groups.setdefault(s.get("worktree", ""), []).append(s)
+
+    def _is_active(wt: str) -> bool:
+        if not wt or not act:
+            return False
+        try:
+            return str(Path(wt).resolve()) == act
+        except Exception:
+            return wt == act
+
+    lines: List[str] = []
+    for wt, items in sorted(groups.items(), key=lambda kv: (not _is_active(kv[0]), kv[0])):
+        labels = ", ".join(format_dev_server_label(s) for s in items)
+        wt_tag = f"`{Path(wt).name}`" if wt else "`?`"
+        if _is_active(wt) or (not act and wt):
+            lines.append(
+                f"- **🟢 Active Dev Servers in THIS worktree** {wt_tag}: {labels} "
+                f"*(REUSE them — do NOT kill or re-spawn; avoids EADDRINUSE, keeps hot-reload & in-memory state)*"
+            )
+        else:
+            ports = ", ".join(str(s["port"]) for s in items)
+            lines.append(
+                f"- **🟠 Host ports taken by neighbor worktree** {wt_tag} (`{wt}`): {labels} "
+                f"*(do NOT bind {ports} here — use another host port in `.env` and a unique `COMPOSE_PROJECT_NAME`)*"
+            )
+    risky = sorted({s.get("compose_project", "") for s in servers if s.get("compose_default_name_risk")})
+    if risky:
+        lines.append(
+            f"- **⚠️ Compose project name = subfolder name** ({', '.join(f'`{r}`' for r in risky)}): "
+            f"`docker compose up` from another worktree will REPLACE these containers — set `COMPOSE_PROJECT_NAME=<repo>-<worktree>`"
+        )
+    return lines
+
+
 def build_auto_state_block(
     project_name: str,
     active_workspace: Path,
@@ -2737,13 +2993,7 @@ def build_auto_state_block(
     sec_num += 1
     base_repo_w, _, all_wt_paths = resolve_repo_and_worktree(active_workspace)
     dev_servers = discover_project_dev_servers(all_wt_paths)
-    if dev_servers:
-        srv_items = [
-            f"`{s['endpoint']}` (`{s['process']}`, PID `{s['pid']}`"
-            + (f", `cwd={Path(s['cwd']).name}`)" if s.get("cwd") else ")")
-            for s in dev_servers
-        ]
-        lines.append(f"- **🟢 Active Dev Servers**: {', '.join(srv_items)} *(already running — do NOT spawn duplicate servers on these ports)*")
+    lines.extend(format_dev_servers_lines(dev_servers, active_workspace))
     if len(all_wt_paths) > 1:
         for wp in all_wt_paths:
             if not wp.exists():
@@ -3233,7 +3483,10 @@ def generate_handoff_markdown(
     if handoff_dev_servers:
         lines.append(
             "- **Active Dev Servers**: "
-            + ", ".join(f"`{s['endpoint']}` (`{s['process']}`, PID `{s['pid']}`)" for s in handoff_dev_servers)
+            + ", ".join(
+                format_dev_server_label(s) + (f" @ `{Path(s['worktree']).name}`" if s.get("worktree") else "")
+                for s in handoff_dev_servers
+            )
         )
     lines.append(f"- **Antigravity Project ID**: `{agy_project_id}` (Turbo / Allow / Eager enabled)")
     lines.append(f"- **Most Recent Agent**: `{parsed_session.get('agent', 'unknown')}` (`{parsed_session.get('sessionId', '')}`)")
@@ -4233,7 +4486,10 @@ def execute_continue_failover(
     dev_servers = discover_project_dev_servers(all_git_paths)
     dev_srv_line = (
         f"- **Активные dev-серверы (не запускать повторно)**: "
-        + ", ".join(f"`{s['endpoint']}` (`{s['process']}`, PID `{s['pid']}`)" for s in dev_servers)
+        + ", ".join(
+            format_dev_server_label(s) + (f" @ `{Path(s['worktree']).name}`" if s.get("worktree") else "")
+            for s in dev_servers
+        )
         + "\n"
         if dev_servers
         else ""

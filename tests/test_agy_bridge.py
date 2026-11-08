@@ -598,5 +598,82 @@ class TestAgyBridgeV03(unittest.TestCase):
             srv_sock.close()
 
 
+    def test_14_docker_compose_ports_mapped_to_worktrees(self) -> None:
+        from unittest import mock
+
+        repo = self.tmp_dir / "compose-repo"
+        self._init_git_repo(repo)
+        wt = repo / ".claude" / "worktrees" / "feat-x"
+        subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "feat-x", str(wt)], check=True)
+        (repo / "docker").mkdir()
+        (wt / "docker").mkdir()
+        all_paths = [repo, wt]
+
+        # Ports column parsing: IPv4 + IPv6 dupes, ranges, unpublished and udp ports
+        self.assertEqual(ab.parse_docker_host_ports("0.0.0.0:5432->5432/tcp, :::5432->5432/tcp"), [5432])
+        self.assertEqual(ab.parse_docker_host_ports("[::]:8080->80/tcp, 6379/tcp, 0.0.0.0:53->53/udp"), [8080])
+        self.assertEqual(ab.parse_docker_host_ports("127.0.0.1:9000-9002->9000-9002/tcp"), [9000, 9001, 9002])
+        self.assertEqual(ab.parse_docker_host_ports(""), [])
+
+        ps_out = "\n".join([
+            # base repo stack, compose file in docker/ subfolder -> default project name `docker`
+            "\t".join(["aaa111bbb222ccc", "docker-db-1", "0.0.0.0:5432->5432/tcp, :::5432->5432/tcp", "docker", str(repo / "docker"), "db"]),
+            # worktree stack with unique project name
+            "\t".join(["ddd333", "featx-web-1", "0.0.0.0:3001->3000/tcp", "compose-repo-feat-x", str(wt / "docker"), "web"]),
+            # foreign project: must be ignored
+            "\t".join(["eee444", "other-web-1", "0.0.0.0:3000->3000/tcp", "other", "/Users/someone/else", "web"]),
+            # container with no published ports
+            "\t".join(["fff555", "docker-redis-1", "6379/tcp", "docker", str(repo / "docker"), "redis"]),
+            "garbage line",
+        ])
+        parsed = ab.parse_docker_compose_ps(ps_out, all_paths)
+        by_port = {s["port"]: s for s in parsed}
+        self.assertEqual(sorted(by_port), [3001, 5432])
+        self.assertEqual(Path(by_port[5432]["worktree"]).resolve(), repo.resolve())
+        # nested worktree must win over the base repo prefix (longest match)
+        self.assertEqual(Path(by_port[3001]["worktree"]).resolve(), wt.resolve())
+        self.assertTrue(by_port[5432]["compose_default_name_risk"])
+        self.assertFalse(by_port[3001]["compose_default_name_risk"])
+        self.assertEqual(by_port[5432]["kind"], "docker")
+        self.assertEqual(by_port[5432]["compose_service"], "db")
+
+        # discover_docker_compose_services: mocked docker CLI + short timeout honoured
+        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=ps_out, stderr="")
+        with mock.patch.object(ab, "_find_docker_bin", return_value="/usr/local/bin/docker"), \
+             mock.patch.object(ab, "_docker_daemon_likely_up", return_value=True), \
+             mock.patch.object(ab.subprocess, "run", return_value=fake) as m_run:
+            got = ab.discover_docker_compose_services(all_paths)
+        self.assertEqual(sorted(s["port"] for s in got), [3001, 5432])
+        self.assertLessEqual(m_run.call_args.kwargs["timeout"], 0.8)
+        self.assertIn("label=com.docker.compose.project", m_run.call_args.args[0])
+
+        # Docker off / CLI timeout -> silently empty, never raises
+        with mock.patch.object(ab, "_find_docker_bin", return_value="/usr/local/bin/docker"), \
+             mock.patch.object(ab, "_docker_daemon_likely_up", return_value=True), \
+             mock.patch.object(ab.subprocess, "run", side_effect=subprocess.TimeoutExpired("docker", 0.7)):
+            self.assertEqual(ab.discover_docker_compose_services(all_paths), [])
+        with mock.patch.object(ab, "_find_docker_bin", return_value=None):
+            self.assertEqual(ab.discover_docker_compose_services(all_paths), [])
+
+        # LIVE_STATE rendering from the feat-x worktree: own stack = REUSE, base repo stack = neighbor
+        lines = "\n".join(ab.format_dev_servers_lines(parsed, wt))
+        self.assertIn("THIS worktree** `feat-x`", lines)
+        self.assertIn("localhost:3001", lines)
+        self.assertIn("REUSE", lines)
+        self.assertIn("neighbor worktree** `compose-repo`", lines)
+        self.assertIn("do NOT bind 5432 here", lines)
+        self.assertIn("COMPOSE_PROJECT_NAME", lines)
+        self.assertIn("`docker`", lines)  # default-name clash warning
+
+        # Full pipeline: docker results merged into build_auto_state_block
+        with mock.patch.object(ab, "_discover_lsof_dev_servers", return_value=[]), \
+             mock.patch.object(ab, "discover_docker_compose_services", return_value=parsed):
+            merged = ab.discover_project_dev_servers(all_paths)
+            self.assertEqual(sorted(s["port"] for s in merged), [3001, 5432])
+            state_md = ab.build_auto_state_block("compose-repo", wt, "test-id", [], [])
+        self.assertIn("docker:web", state_md)
+        self.assertIn("do NOT bind 5432 here", state_md)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
