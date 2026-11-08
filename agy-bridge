@@ -1379,6 +1379,11 @@ def resolve_live_claude_socket(target: str) -> Optional[Dict[str, Any]]:
             for s in sockets:
                 if s["cwd"] and any(ps == str(Path(s["cwd"]).resolve()) for ps in path_strs):
                     return s
+            proj_basename = base_repo.name.lower()
+            if len(proj_basename) >= 3:
+                for s in sockets:
+                    if proj_basename in (s.get("name") or "").lower():
+                        return s
     except Exception:
         pass
 
@@ -1456,6 +1461,42 @@ def send_claude_socket_message(
             s.close()
         except Exception:
             pass
+
+
+def open_or_resume_claude_desktop_session(
+    workspace_path: Path,
+    exported_jsonl: Optional[Path] = None,
+    host_session_id: str = "",
+    wait_for_socket: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """
+    Opens or imports a project session in Claude Desktop (`Claude.app`) via its native macOS deep links:
+      - `claude://resume?session=<uuid>` imports `~/.claude/projects/<slug>/<uuid>.jsonl` into `local_<uuid>.json`,
+        opens it in the Claude Desktop Code tab, and spawns its live `/tmp/cc-socks/<pid>.sock` daemon.
+      - `claude://code/continue?session=<local_uuid>` focuses an already imported Desktop session.
+      - `claude://code/new?folder=<path>` opens a new Code session bound to `workspace_path`.
+    Never runs for ephemeral `/tmp` or `/var/folders` test workspaces.
+    """
+    if is_ephemeral_temp_dir(workspace_path) or not Path("/Applications/Claude.app").exists():
+        return None
+    deep_link = ""
+    if exported_jsonl is not None and exported_jsonl.exists() and is_uuid(exported_jsonl.stem):
+        deep_link = f"claude://resume?session={exported_jsonl.stem}"
+    elif host_session_id:
+        deep_link = f"claude://code/continue?session={urllib.parse.quote(host_session_id)}"
+    else:
+        deep_link = f"claude://code/new?folder={urllib.parse.quote(str(workspace_path.resolve()))}"
+    try:
+        subprocess.run(["/usr/bin/open", deep_link], capture_output=True, timeout=5)
+    except Exception:
+        return None
+    if wait_for_socket:
+        for _ in range(14):
+            sock = resolve_live_claude_socket(str(workspace_path))
+            if sock:
+                return sock
+            time.sleep(0.25)
+    return resolve_live_claude_socket(str(workspace_path))
 
 
 # ---------------------------------------------------------------------------
@@ -2942,6 +2983,11 @@ META_HANDOFF_PATTERNS = (
     "продолжи задачу",
     "перекинь в",
     "перенеси в",
+    "создай в клоде",
+    "создай в антигравити",
+    "открой в клоде",
+    "открой в антигравити",
+    "чат с этим проектом",
     "continue from",
     "continue task",
     "switch to",
@@ -4215,13 +4261,43 @@ def execute_continue_failover(
                 focus_agy_conversation(cid, project_id=project_id)
             action_result = {"targetAgent": "agy", "spawned": (rc == 0), "cascadeId": cid, "returnCode": rc, "error": err}
         elif to_agent_norm == "claude":
-            rc, sock_info, err = send_claude_socket_message(str(active_ws), recovery_prompt)
+            exported_jsonl: Optional[Path] = None
+            if latest_session and source_agent != "claude":
+                exported_jsonl = export_to_claude_jsonl(latest_session, active_ws)
+            matched_sock = resolve_live_claude_socket(str(active_ws))
+            if not matched_sock and focus:
+                matched_sock = open_or_resume_claude_desktop_session(
+                    active_ws, exported_jsonl=exported_jsonl, wait_for_socket=True
+                )
+            elif matched_sock and focus and matched_sock.get("hostSessionId"):
+                open_or_resume_claude_desktop_session(
+                    active_ws, exported_jsonl=None, host_session_id=matched_sock["hostSessionId"], wait_for_socket=False
+                )
+            claude_prompt = recovery_prompt
+            if matched_sock and matched_sock.get("cwd") and str(Path(matched_sock["cwd"]).resolve()) != str(active_ws.resolve()):
+                claude_prompt += (
+                    f"\n\nВАЖНО: Сейчас твоя сессия привязана к `{matched_sock['cwd']}`. "
+                    f"Сразу переключи рабочую папку этой сессии на `{active_ws}` (через `mcp__ccd_directory__change_directory` с `path=\"{active_ws}\"`) "
+                    f"и работай в `{active_ws}`."
+                )
+            rc, sock_info, err = send_claude_socket_message(str(active_ws), claude_prompt)
             if rc == 0:
-                action_result = {"targetAgent": "claude", "spawned": True, "mode": "live_socket", "socket": sock_info.get("socketPath")}
+                action_result = {
+                    "targetAgent": "claude",
+                    "spawned": True,
+                    "mode": "live_socket",
+                    "socket": sock_info.get("socketPath"),
+                    "sessionName": sock_info.get("name", ""),
+                    "exportedJsonl": str(exported_jsonl) if exported_jsonl else "",
+                }
             else:
-                if latest_session and source_agent != "claude":
-                    export_to_claude_jsonl(latest_session, active_ws)
-                action_result = {"targetAgent": "claude", "spawned": False, "mode": "prepared_workspace", "note": err}
+                action_result = {
+                    "targetAgent": "claude",
+                    "spawned": bool(exported_jsonl),
+                    "mode": "imported_desktop_session" if exported_jsonl else "prepared_workspace",
+                    "exportedJsonl": str(exported_jsonl) if exported_jsonl else "",
+                    "note": err,
+                }
         elif to_agent_norm == "codex":
             register_in_codex(all_git_paths)
             action_result = {"targetAgent": "codex", "spawned": True, "mode": "registered_in_codex"}
