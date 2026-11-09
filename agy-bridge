@@ -2895,6 +2895,433 @@ def format_dev_servers_lines(servers: List[Dict[str, Any]], active_workspace: Op
     return lines
 
 
+# ---------------------------------------------------------------------------
+# Pre-flight port checks: compose config (BEFORE `docker compose up`) + .env PORT keys
+# ---------------------------------------------------------------------------
+COMPOSE_FILE_NAMES = ("compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml")
+COMPOSE_CONFIG_TIMEOUT_SEC = 1.5
+ENV_PORT_FILES = (".env", ".env.local", ".env.development", ".env.development.local")
+_ENV_PORT_RE = re.compile(
+    r"^\s*(?:export\s+)?(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*[\"']?(?P<val>\d{1,5})[\"']?\s*(?:#.*)?$"
+)
+_ENV_PORT_KEY_RE = re.compile(r"(?:^|_)PORT(?:_|$)", re.IGNORECASE)
+_SKIP_SCAN_DIRS = {"node_modules", "vendor", "venv", "__pycache__", "dist", "build", "target"}
+# Set to False by hook-sync on mid-session events (PostToolUse): then `docker compose config`
+# is never spawned and only a still-valid mtime cache is used.
+PREFLIGHT_ALLOW_DOCKER = True
+
+
+def read_env_port_keys(env_path: Path) -> Dict[str, int]:
+    """
+    Reads ONLY `*PORT*` keys with plain numeric values from a dotenv file (e.g. PORT, DB_PORT, VITE_PORT).
+    Any other line (secrets, URLs, tokens) is skipped without being stored.
+    """
+    out: Dict[str, int] = {}
+    try:
+        if not env_path.is_file() or env_path.stat().st_size > 256 * 1024:
+            return out
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = _ENV_PORT_RE.match(line)
+            if not m or not _ENV_PORT_KEY_RE.search(m.group("key")):
+                continue
+            v = int(m.group("val"))
+            if 1 <= v <= 65535:
+                out[m.group("key")] = v
+    except Exception:
+        pass
+    return out
+
+
+def _read_env_compose_file(env_path: Path) -> str:
+    """Returns COMPOSE_FILE from a dotenv file (a path list, not a secret) or ''."""
+    try:
+        if not env_path.is_file():
+            return ""
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = re.match(r"^\s*(?:export\s+)?COMPOSE_FILE\s*=\s*[\"']?([^\"'#]+?)[\"']?\s*(?:#.*)?$", line)
+            if m:
+                return m.group(1).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def find_compose_units(worktree: Path) -> List[Dict[str, Any]]:
+    """
+    Compose "units" = directories where a dev would run `docker compose up`:
+    the worktree root (compose file there, or COMPOSE_FILE in root .env) and first-level
+    subfolders such as `docker/` with their own compose file.
+    """
+    units: List[Dict[str, Any]] = []
+    root_env = worktree / ".env"
+    cf = os.environ.get("COMPOSE_FILE") or _read_env_compose_file(root_env)
+    root_files: List[Path] = []
+    if cf:
+        sep = os.environ.get("COMPOSE_PATH_SEPARATOR") or (";" if ";" in cf else ":")
+        for part in cf.split(sep):
+            part = part.strip()
+            if part:
+                fp = (worktree / part) if not Path(part).is_absolute() else Path(part)
+                if fp.is_file():
+                    root_files.append(fp)
+    if not root_files:
+        root_files = [worktree / n for n in COMPOSE_FILE_NAMES if (worktree / n).is_file()]
+        for n in COMPOSE_FILE_NAMES:
+            ov = worktree / n.replace(".y", ".override.y")
+            if root_files and ov.is_file() and ov not in root_files:
+                root_files.append(ov)
+    if root_files:
+        units.append({"dir": worktree, "files": root_files, "env": [root_env]})
+    try:
+        subdirs = sorted(d for d in worktree.iterdir() if d.is_dir())[:80]
+    except Exception:
+        subdirs = []
+    covered = {f.parent.resolve() for f in root_files}
+    for d in subdirs:
+        if d.name.startswith(".") or d.name in _SKIP_SCAN_DIRS:
+            continue
+        files = [d / n for n in COMPOSE_FILE_NAMES if (d / n).is_file()]
+        if files and d.resolve() not in covered:
+            units.append({"dir": d, "files": files, "env": [d / ".env"]})
+    return units
+
+
+def _unit_signature(unit: Dict[str, Any]) -> str:
+    parts = []
+    for f in list(unit["files"]) + list(unit["env"]):
+        try:
+            st = f.stat()
+            parts.append(f"{f}:{st.st_mtime_ns}:{st.st_size}")
+        except FileNotFoundError:
+            parts.append(f"{f}:-")
+    parts.append("CF=" + (os.environ.get("COMPOSE_FILE") or ""))
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:24]
+
+
+def parse_compose_config_ports(config_json: str) -> Dict[str, Any]:
+    """
+    Parse `docker compose config --format json` into
+    {"project": name, "ports": [{"port", "host_ip", "service", "target"}]} (published TCP host ports only).
+    """
+    try:
+        data = json.loads(config_json or "{}")
+    except Exception:
+        return {"project": "", "ports": []}
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    services = data.get("services") or {}
+    if not isinstance(services, dict):
+        services = {}
+    for svc_name, svc in services.items():
+        for prt in (svc or {}).get("ports") or []:
+            if isinstance(prt, (str, int)):
+                # short syntax leftover (older compose): "[ip:]host:container[/proto]"
+                txt = str(prt)
+                proto = "tcp"
+                if "/" in txt:
+                    txt, proto = txt.rsplit("/", 1)
+                bits = txt.rsplit(":", 2)
+                if len(bits) < 2:
+                    continue
+                prt = {"published": bits[-2], "target": bits[-1], "host_ip": bits[0] if len(bits) == 3 else "", "protocol": proto}
+            if not isinstance(prt, dict):
+                continue
+            if str(prt.get("protocol") or "tcp").lower() != "tcp":
+                continue
+            pub = str(prt.get("published") or "").strip()
+            if not pub:
+                continue  # ephemeral host port: can't clash
+            if "-" in pub:
+                a, _, b = pub.partition("-")
+                rng = range(int(a), int(b) + 1) if a.isdigit() and b.isdigit() and 0 <= int(b) - int(a) <= 64 else range(0)
+            else:
+                rng = range(int(pub), int(pub) + 1) if pub.isdigit() else range(0)
+            for pt in rng:
+                if (pt, svc_name) in seen:
+                    continue
+                seen.add((pt, svc_name))
+                out.append({
+                    "port": pt,
+                    "host_ip": str(prt.get("host_ip") or ""),
+                    "service": str(svc_name),
+                    "target": prt.get("target"),
+                })
+    out.sort(key=lambda x: (x["port"], x["service"]))
+    return {"project": str(data.get("name") or ""), "ports": out}
+
+
+def run_compose_config(unit_dir: Path) -> Optional[str]:
+    """`docker compose config --format json` in the unit dir (native .env interpolation). None on any failure."""
+    if os.environ.get("AGY_BRIDGE_NO_DOCKER") == "1":
+        return None
+    docker_bin = _find_docker_bin()
+    if not docker_bin:
+        return None
+    try:
+        r = subprocess.run(
+            [docker_bin, "compose", "config", "--format", "json"],
+            cwd=str(unit_dir),
+            capture_output=True,
+            text=True,
+            timeout=COMPOSE_CONFIG_TIMEOUT_SEC,
+        )
+    except Exception:
+        return None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    return r.stdout
+
+
+def compose_preflight_ports(worktree: Path, cache_dir: Optional[Path]) -> List[Dict[str, Any]]:
+    """
+    Published host ports each compose unit of `worktree` WILL bind on `docker compose up`.
+    Cached by mtime/size of compose files + .env in `<cache_dir>/compose_preflight.json`,
+    so docker is spawned only when those files change.
+    """
+    if os.environ.get("AGY_BRIDGE_NO_DOCKER") == "1":
+        return []
+    units = find_compose_units(worktree)
+    if not units:
+        return []
+    cache: Dict[str, Any] = {}
+    cache_file = (cache_dir / "compose_preflight.json") if cache_dir else None
+    if cache_file and cache_file.exists():
+        try:
+            cache = json.loads(cache_file.read_text(encoding="utf-8")) or {}
+        except Exception:
+            cache = {}
+    dirty = False
+    results: List[Dict[str, Any]] = []
+    for u in units:
+        key = str(u["dir"])
+        sig = _unit_signature(u)
+        entry = cache.get(key)
+        if not (isinstance(entry, dict) and entry.get("sig") == sig):
+            entry = None
+            if PREFLIGHT_ALLOW_DOCKER:
+                raw = run_compose_config(u["dir"])
+                if raw is not None:
+                    entry = {"sig": sig, **parse_compose_config_ports(raw)}
+                    cache[key] = entry
+                    dirty = True
+        if not entry:
+            continue
+        for pr in entry.get("ports") or []:
+            results.append({**pr, "project": entry.get("project", ""), "unit_dir": key, "source": f"compose:{pr.get('service')}"})
+    if dirty and cache_file:
+        try:
+            atomic_write_text(cache_file, json.dumps(cache, indent=1))
+        except Exception:
+            pass
+    return results
+
+
+def env_needed_ports(worktree: Path) -> List[Dict[str, Any]]:
+    """`*PORT*` keys from .env files in the worktree root and its compose subfolders."""
+    dirs = [worktree]
+    try:
+        for d in sorted(worktree.iterdir())[:80]:
+            if d.is_dir() and not d.name.startswith(".") and d.name not in _SKIP_SCAN_DIRS and any((d / n).is_file() for n in COMPOSE_FILE_NAMES):
+                dirs.append(d)
+    except Exception:
+        pass
+    out: List[Dict[str, Any]] = []
+    for d in dirs:
+        for fname in ENV_PORT_FILES:
+            for k, v in read_env_port_keys(d / fname).items():
+                rel = f"{d.name}/{fname}" if d != worktree else fname
+                out.append({"port": v, "source": f"{rel} {k}"})
+    return out
+
+
+def find_port_holders(ports: List[int]) -> Dict[int, List[Dict[str, Any]]]:
+    """Who LISTENs on these TCP ports: {port: [{pid, process, cwd, args}]} via one lsof call (+ connect fallback)."""
+    holders: Dict[int, List[Dict[str, Any]]] = {}
+    ports = sorted({int(p) for p in ports if 0 < int(p) < 65536})[:24]
+    if not ports:
+        return holders
+    lsof_bin = "/usr/sbin/lsof" if Path("/usr/sbin/lsof").exists() else shutil.which("lsof")
+    pid_cmd: Dict[str, str] = {}
+    pid_ports: Dict[str, List[int]] = {}
+    if lsof_bin:
+        try:
+            r = subprocess.run(
+                [lsof_bin, "-nP", "-sTCP:LISTEN", "-F", "pcn"] + [f"-iTCP:{pt}" for pt in ports],
+                capture_output=True, text=True, timeout=1.5,
+            )
+            cur = ""
+            for line in r.stdout.splitlines():
+                if not line:
+                    continue
+                tag, val = line[0], line[1:]
+                if tag == "p":
+                    cur = val.strip()
+                elif tag == "c" and cur:
+                    pid_cmd[cur] = val.strip()
+                elif tag == "n" and cur and ":" in val:
+                    pp = val.rsplit(":", 1)[-1].strip()
+                    if pp.isdigit() and int(pp) in ports:
+                        pid_ports.setdefault(cur, [])
+                        if int(pp) not in pid_ports[cur]:
+                            pid_ports[cur].append(int(pp))
+        except Exception:
+            pass
+    pid_cwd: Dict[str, str] = {}
+    pid_args: Dict[str, str] = {}
+    if pid_ports and lsof_bin:
+        arg = ",".join(pid_ports.keys())
+        try:
+            r = subprocess.run([lsof_bin, "-a", "-p", arg, "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=1.5)
+            cp = ""
+            for line in r.stdout.splitlines():
+                if line.startswith("p"):
+                    cp = line[1:].strip()
+                elif line.startswith("n") and cp:
+                    pid_cwd[cp] = line[1:].strip()
+        except Exception:
+            pass
+        try:
+            r = subprocess.run(["/bin/ps", "-o", "pid=,args=", "-p", arg], capture_output=True, text=True, timeout=1.0)
+            for line in r.stdout.splitlines():
+                bits = line.strip().split(None, 1)
+                if len(bits) == 2 and bits[0].isdigit():
+                    pid_args[bits[0]] = bits[1]
+        except Exception:
+            pass
+    for pid, pts in pid_ports.items():
+        for pt in pts:
+            holders.setdefault(pt, []).append({
+                "pid": int(pid), "process": pid_cmd.get(pid, "?"),
+                "cwd": pid_cwd.get(pid, ""), "args": pid_args.get(pid, ""),
+            })
+    # Processes of other users (root daemons) are invisible to lsof: probe with a 50ms connect
+    for pt in ports:
+        if pt in holders:
+            continue
+        try:
+            with socket.create_connection(("127.0.0.1", pt), timeout=0.05):
+                holders[pt] = [{"pid": 0, "process": "unknown (not visible to lsof, e.g. root daemon)", "cwd": "", "args": ""}]
+        except Exception:
+            pass
+    return holders
+
+
+def preflight_port_conflicts(
+    active_workspace: Path,
+    all_git_paths: List[Path],
+    running: List[Dict[str, Any]],
+    cache_dir: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Ports this worktree NEEDS (compose published ports + .env *PORT* keys) vs. who already holds them:
+      - severity "block": compose port held by a neighbor worktree / another process → `docker compose up` would fail
+      - severity "warn":  .env port held by an unrelated process (not from this repo or its worktrees)
+    Ports held by this worktree's own running stack/app are treated as REUSE, not conflicts.
+    """
+    try:
+        act_res = active_workspace.resolve()
+    except Exception:
+        act_res = active_workspace
+    compose_ports = compose_preflight_ports(active_workspace, cache_dir)
+    env_ports = env_needed_ports(active_workspace)
+    if not compose_ports and not env_ports:
+        return []
+
+    needed: Dict[int, Dict[str, Any]] = {}
+    for cp in compose_ports:
+        e = needed.setdefault(cp["port"], {"port": cp["port"], "sources": [], "compose": None})
+        e["sources"].append(cp["source"])
+        if e["compose"] is None:
+            e["compose"] = cp
+    for ep in env_ports:
+        e = needed.setdefault(ep["port"], {"port": ep["port"], "sources": [], "compose": None})
+        if ep["source"] not in e["sources"]:
+            e["sources"].append(ep["source"])
+
+    def _same_wt(wt: str) -> bool:
+        if not wt:
+            return False
+        try:
+            return Path(wt).resolve() == act_res
+        except Exception:
+            return False
+
+    running_by_port: Dict[int, List[Dict[str, Any]]] = {}
+    for s in running:
+        running_by_port.setdefault(s["port"], []).append(s)
+
+    conflicts: List[Dict[str, Any]] = []
+    unresolved: List[int] = []
+    for pt, need in sorted(needed.items()):
+        comp = need["compose"]
+        known = running_by_port.get(pt) or []
+        if known:
+            own = [s for s in known if _same_wt(s.get("worktree", ""))]
+            if comp and own:
+                # own stack already up with the same project → reuse; a different process in this worktree → clash
+                if any(s.get("kind") == "docker" and s.get("compose_project") == comp.get("project") for s in own):
+                    continue
+                s = own[0]
+                conflicts.append({"port": pt, "severity": "block", "sources": need["sources"], "compose": comp,
+                                  "holder": f"`{s['process']}`" + (f" (PID {s['pid']})" if s.get("pid") else "") + " in THIS worktree",
+                                  "holder_kind": "same_worktree"})
+                continue
+            if own or not comp:
+                continue  # the app itself runs here, or a neighbor's port already shown in the 🟠 line
+            s = known[0]
+            wt_name = Path(s["worktree"]).name if s.get("worktree") else "?"
+            label = f"`{s['process']}`" + (f", compose `{s['compose_project']}`" if s.get("compose_project") else (f", PID {s['pid']}" if s.get("pid") else ""))
+            conflicts.append({"port": pt, "severity": "block" if comp else "warn", "sources": need["sources"], "compose": comp,
+                              "holder": f"neighbor worktree `{wt_name}` ({label})", "holder_kind": "neighbor"})
+            continue
+        unresolved.append(pt)
+
+    if unresolved:
+        holders = find_port_holders(unresolved)
+        for pt in unresolved:
+            hs = holders.get(pt) or []
+            foreign = [h for h in hs if match_worktree_for_path(h["cwd"], all_git_paths, h["args"]) is None]
+            if not foreign:
+                continue
+            h = foreign[0]
+            name = h["process"]
+            low = name.lower()
+            if low.startswith(("com.docker", "vpnkit", "docker", "orbstack", "limactl", "ssh")) and h["pid"]:
+                name += " — a Docker container of ANOTHER project"
+            need = needed[pt]
+            conflicts.append({"port": pt, "severity": "block" if need["compose"] else "warn", "sources": need["sources"],
+                              "compose": need["compose"], "holder_kind": "foreign",
+                              "holder": f"unrelated process `{name}`" + (f" (PID {h['pid']})" if h["pid"] else "")})
+    conflicts.sort(key=lambda c: (c["severity"] != "block", c["port"]))
+    return conflicts
+
+
+def format_preflight_lines(conflicts: List[Dict[str, Any]], active_workspace: Path, max_lines: int = 6) -> List[str]:
+    lines: List[str] = []
+    for c in conflicts[:max_lines]:
+        src = ", ".join(f"`{x}`" for x in c["sources"][:3])
+        if c["severity"] == "block":
+            comp = c["compose"] or {}
+            try:
+                rel = Path(comp.get("unit_dir", "")).relative_to(active_workspace)
+                where = "." if str(rel) == "." else f"{rel}/"
+            except Exception:
+                where = "."
+            lines.append(
+                f"- **⛔ Compose pre-flight** (`{where}`, project `{comp.get('project', '')}`): wants host port "
+                f"`{c['port']}` ({src}) — already taken by {c['holder']} → change the port in `.env` "
+                f"or stop that {'process' if c['holder_kind'] == 'foreign' else 'stack'} BEFORE `docker compose up`"
+            )
+        else:
+            lines.append(
+                f"- **⚠️ Port `{c['port']}` needed by this project** ({src}) is held by {c['holder']} "
+                f"→ use another port in `.env` or stop that process"
+            )
+    if len(conflicts) > max_lines:
+        lines.append(f"- *(+{len(conflicts) - max_lines} more port conflict(s): run `agy-bridge sync` for details)*")
+    return lines
+
+
 def build_auto_state_block(
     project_name: str,
     active_workspace: Path,
@@ -2994,6 +3421,13 @@ def build_auto_state_block(
     base_repo_w, _, all_wt_paths = resolve_repo_and_worktree(active_workspace)
     dev_servers = discover_project_dev_servers(all_wt_paths)
     lines.extend(format_dev_servers_lines(dev_servers, active_workspace))
+    try:
+        pf_conflicts = preflight_port_conflicts(
+            active_workspace, all_wt_paths, dev_servers, cache_dir=get_git_common_bridge_dir(base_repo_w)
+        )
+        lines.extend(format_preflight_lines(pf_conflicts, active_workspace))
+    except Exception:
+        pass
     if len(all_wt_paths) > 1:
         for wp in all_wt_paths:
             if not wp.exists():
@@ -4715,8 +5149,12 @@ def cmd_hook_sync(args: argparse.Namespace) -> int:
                     need_full_sync = True
 
             if need_full_sync:
+                # `docker compose config` pre-flight only on SessionStart / Stop / StopFailure (cache-only mid-session)
+                global PREFLIGHT_ALLOW_DOCKER
+                PREFLIGHT_ALLOW_DOCKER = event_name in ("Stop", "StopFailure", "SessionStart")
                 sync_ns = argparse.Namespace(target=str(p), workspace=str(p), quiet=True, write_docs=False)
                 cmd_sync(sync_ns)
+                PREFLIGHT_ALLOW_DOCKER = True
 
             if event_name == "StopFailure":
                 sid = str(hook_input.get("session_id") or hook_input.get("conversationId") or "")

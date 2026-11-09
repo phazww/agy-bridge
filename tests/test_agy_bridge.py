@@ -675,5 +675,146 @@ class TestAgyBridgeV03(unittest.TestCase):
         self.assertIn("do NOT bind 5432 here", state_md)
 
 
+    def test_15_compose_preflight_and_foreign_port_holders(self) -> None:
+        import socket
+        from unittest import mock
+
+        repo = self.tmp_dir / "preflight-repo"
+        self._init_git_repo(repo)
+        wt = repo / ".claude" / "worktrees" / "feat-y"
+        subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "feat-y", str(wt)], check=True)
+        (wt / "docker").mkdir()
+        (wt / "docker" / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        all_paths = [repo, wt]
+
+        # 1) parsing `docker compose config --format json`
+        cfg = json.dumps({
+            "name": "docker",
+            "services": {
+                "db": {"ports": [{"mode": "ingress", "host_ip": "127.0.0.1", "target": 5432, "published": "5432", "protocol": "tcp"}]},
+                "web": {"ports": [{"target": 3000, "published": "3000-3001", "protocol": "tcp"},
+                                  {"target": 9229, "protocol": "tcp"},          # ephemeral: ignored
+                                  {"target": 53, "published": "5353", "protocol": "udp"}]},  # udp: ignored
+                "worker": {},
+            },
+        })
+        parsed = ab.parse_compose_config_ports(cfg)
+        self.assertEqual(parsed["project"], "docker")
+        self.assertEqual([(x["port"], x["service"]) for x in parsed["ports"]], [(3000, "web"), (3001, "web"), (5432, "db")])
+        self.assertEqual(parsed["ports"][-1]["host_ip"], "127.0.0.1")
+        self.assertEqual(ab.parse_compose_config_ports("not json")["ports"], [])
+
+        # 2) .env: only *PORT* keys with numeric values, secrets never read into the result
+        (wt / ".env").write_text("\n".join([
+            "PORT=8080", "export VITE_PORT='5173'", "DB_PASSWORD=5432", "REPORT_LEVEL=3",
+            "API_PORT=not-a-number", "SUPPORT_EMAIL=a@b.c", "# DB_PORT=1111",
+        ]) + "\n", encoding="utf-8")
+        self.assertEqual(ab.read_env_port_keys(wt / ".env"), {"PORT": 8080, "VITE_PORT": 5173})
+
+        # compose units: subfolder detected; COMPOSE_FILE from root .env respected
+        units = ab.find_compose_units(wt)
+        self.assertEqual([u["dir"].name for u in units], ["docker"])
+        (wt / "infra").mkdir()
+        (wt / "infra" / "stack.yml").write_text("services: {}\n", encoding="utf-8")
+        (wt / ".env").write_text("PORT=8080\nCOMPOSE_FILE=infra/stack.yml\n", encoding="utf-8")
+        units = ab.find_compose_units(wt)
+        self.assertEqual(units[0]["dir"], wt)
+        self.assertEqual(units[0]["files"], [wt / "infra" / "stack.yml"])
+        (wt / ".env").write_text("PORT=8080\n", encoding="utf-8")
+
+        # 3) mtime cache: docker spawned once, again only after compose/.env change; cache-only when docker disallowed
+        cache_dir = self.tmp_dir / "cache"
+        cache_dir.mkdir()
+        calls = []
+
+        def fake_cfg(unit_dir):
+            calls.append(unit_dir)
+            return cfg
+
+        with mock.patch.object(ab, "run_compose_config", side_effect=fake_cfg):
+            r1 = ab.compose_preflight_ports(wt, cache_dir)
+            r2 = ab.compose_preflight_ports(wt, cache_dir)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(sorted({x["port"] for x in r1}), [3000, 3001, 5432])
+            self.assertEqual(r1, r2)
+            time.sleep(0.01)
+            (wt / "docker" / ".env").write_text("DB_PORT=5432\n", encoding="utf-8")
+            ab.compose_preflight_ports(wt, cache_dir)
+            self.assertEqual(len(calls), 2)
+            (wt / "docker" / "docker-compose.yml").write_text("services: {x: {}}\n", encoding="utf-8")
+            old = ab.PREFLIGHT_ALLOW_DOCKER
+            ab.PREFLIGHT_ALLOW_DOCKER = False
+            try:
+                self.assertEqual(ab.compose_preflight_ports(wt, cache_dir), [])  # stale cache + no docker allowed
+                self.assertEqual(len(calls), 2)
+            finally:
+                ab.PREFLIGHT_ALLOW_DOCKER = old
+
+        # 4) timeout / missing docker / AGY_BRIDGE_NO_DOCKER=1 -> silently nothing
+        with mock.patch.object(ab, "_find_docker_bin", return_value="/usr/local/bin/docker"), \
+             mock.patch.object(ab.subprocess, "run", side_effect=subprocess.TimeoutExpired("docker", 1.5)) as m_run:
+            self.assertIsNone(ab.run_compose_config(wt / "docker"))
+            self.assertLessEqual(m_run.call_args.kwargs["timeout"], 1.5)
+        with mock.patch.object(ab, "_find_docker_bin", return_value=None):
+            self.assertIsNone(ab.run_compose_config(wt / "docker"))
+        with mock.patch.dict(os.environ, {"AGY_BRIDGE_NO_DOCKER": "1"}), \
+             mock.patch.object(ab.subprocess, "run") as m_never:
+            self.assertIsNone(ab.run_compose_config(wt / "docker"))
+            self.assertEqual(ab.compose_preflight_ports(wt, self.tmp_dir / "cache2"), [])
+            m_never.assert_not_called()
+
+        # 5) matching wanted ports against holders
+        neighbor_db = {"port": 5432, "endpoint": "localhost:5432", "pid": 0, "process": "docker:db", "kind": "docker",
+                       "compose_project": "docker", "worktree": str(repo)}
+        own_web = {"port": 3000, "endpoint": "localhost:3000", "pid": 0, "process": "docker:web", "kind": "docker",
+                   "compose_project": "docker", "worktree": str(wt)}
+        compose_ports = [{**x, "project": "docker", "unit_dir": str(wt / "docker"), "source": f"compose:{x['service']}"}
+                         for x in parsed["ports"]]
+        foreign = {3001: [{"pid": 4242, "process": "postgres", "cwd": "/opt/homebrew/var", "args": "postgres -D /opt/homebrew/var"}],
+                   8080: [{"pid": 777, "process": "nginx", "cwd": "/", "args": "nginx"}]}
+        with mock.patch.object(ab, "compose_preflight_ports", return_value=compose_ports), \
+             mock.patch.object(ab, "find_port_holders", side_effect=lambda pts: {p: foreign[p] for p in pts if p in foreign}) as m_h:
+            conf = ab.preflight_port_conflicts(wt, all_paths, [neighbor_db, own_web], cache_dir=cache_dir)
+        by = {c["port"]: c for c in conf}
+        self.assertNotIn(3000, by)  # own running stack = reuse, not a conflict
+        self.assertEqual(by[5432]["severity"], "block")
+        self.assertIn("neighbor worktree `preflight-repo`", by[5432]["holder"])
+        self.assertEqual(by[3001]["severity"], "block")
+        self.assertIn("postgres", by[3001]["holder"])
+        self.assertEqual(by[8080]["severity"], "warn")  # .env PORT held by an unrelated process
+        self.assertIn("`.env PORT`", ab.format_preflight_lines(conf, wt)[-1])
+        self.assertNotIn(5432, m_h.call_args.args[0])  # already explained by neighbor, no lsof needed
+
+        lines = "\n".join(ab.format_preflight_lines(conf, wt))
+        self.assertIn("⛔ Compose pre-flight** (`docker/`, project `docker`): wants host port `5432`", lines)
+        self.assertIn("unrelated process `postgres` (PID 4242)", lines)
+        self.assertIn("⚠️ Port `8080` needed by this project", lines)
+        self.assertIn("nginx", lines)
+
+        # 6) real lsof: an unrelated listener (cwd outside repo) on a .env port is reported, in-repo one is not
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        try:
+            (wt / ".env").write_text(f"PORT={port}\n", encoding="utf-8")
+            holders = ab.find_port_holders([port])
+            self.assertIn(port, holders)
+            self.assertEqual(holders[port][0]["pid"], os.getpid())
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(self.tmp_dir)  # this process is now "foreign" to the repo
+                with mock.patch.object(ab, "compose_preflight_ports", return_value=[]):
+                    conf = ab.preflight_port_conflicts(wt, all_paths, [], cache_dir=cache_dir)
+                self.assertEqual([(c["port"], c["severity"], c["holder_kind"]) for c in conf], [(port, "warn", "foreign")])
+                os.chdir(wt)  # now it belongs to this worktree -> nothing
+                with mock.patch.object(ab, "compose_preflight_ports", return_value=[]):
+                    self.assertEqual(ab.preflight_port_conflicts(wt, all_paths, [], cache_dir=cache_dir), [])
+            finally:
+                os.chdir(old_cwd)
+        finally:
+            srv.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

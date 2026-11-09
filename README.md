@@ -21,6 +21,8 @@ When you hit a rate limit mid-task in **Claude Code**, or switch to **Antigravit
 - **Zero Git Noise**: Tracked `CLAUDE.md` and `AGENTS.md` stay **100% clean**. A ~350-token Progress State is dynamically injected into agent memory only when another IDE actually changed state (**0 extra tokens** on normal mid-session turns via a SHA-256 delta cursor).
 - **Shared SQLite WAL + FTS5 Across All Worktrees**: Stored once in `$(git rev-parse --git-common-dir)/agy-bridge/state.sqlite` with `fcntl.flock` concurrency safety, linking all `.claude/worktrees/<name>` with the base repository and tracking uncommitted diffs, architectural decisions, failed dead-ends, and open questions.
 - **Active Dev Servers & Port Detection**: Automatically detects running local dev servers (`localhost:3000 (node, PID 12345)`) bound to the project or active worktree so the next agent never spawns a duplicate server on a busy port.
+- **Compose Pre-flight (before `docker compose up`)**: runs `docker compose config --format json` (1.5s timeout, cached by compose/`.env` mtime, only on SessionStart/Stop) and flags `⛔` when a published host port is already taken by a neighbor worktree or another process — so the bind never fails. `AGY_BRIDGE_NO_DOCKER=1` disables it.
+- **Foreign Port Holders**: reads only `*PORT*` keys from `.env` files (numeric values, nothing else) and warns `⚠️` when a port the project needs is held by an unrelated process outside the repo (e.g. a Homebrew Postgres on 5432), without listing any other foreign listeners.
 - **Built-in MCP Server (`agy-bridge mcp`, <180 tokens schema)**: Just tell any IDE in plain chat *"continue where Claude stopped"* or *"check what the other agent did"* — the agent calls the native MCP tool automatically.
 
 ---
