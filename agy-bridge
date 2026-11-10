@@ -1104,7 +1104,38 @@ def list_codex_sessions(limit: int = 10) -> Dict[str, Any]:
             conn.close()
         except Exception:
             pass
+    if not threads:
+        threads = scan_codex_rollouts(limit)
     return {"workspaces": workspaces, "threads": threads}
+
+
+def scan_codex_rollouts(limit: int = 10, sessions_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Fallback: read `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` directly (first `session_meta` line only)."""
+    root = sessions_dir or (CODEX_DIR / "sessions")
+    if not root.exists():
+        return []
+    files = sorted(root.glob("*/*/*/rollout-*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)[: max(limit, 1)]
+    out: List[Dict[str, Any]] = []
+    for f in files:
+        sid, cwd, branch = f.stem[-36:], "", ""
+        try:
+            with f.open("r", encoding="utf-8", errors="replace") as fh:
+                for _ in range(5):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    rec = json.loads(line)
+                    if rec.get("type") == "session_meta" and isinstance(rec.get("payload"), dict):
+                        pl = rec["payload"]
+                        sid = pl.get("id") or sid
+                        cwd = pl.get("cwd") or ""
+                        branch = ((pl.get("git") or {}).get("branch") or "") if isinstance(pl.get("git"), dict) else ""
+                        break
+        except Exception:
+            continue
+        out.append({"id": sid, "title": "", "cwd": cwd, "gitBranch": branch,
+                    "updatedAt": ts_to_iso(f.stat().st_mtime), "rolloutPath": str(f)})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2039,8 +2070,18 @@ def parse_codex_jsonl(jsonl_path: Path, max_turns: int = 0) -> Dict[str, Any]:
                                 if isinstance(c, dict) and c.get("text"):
                                     parts.append(c["text"].strip())
                         txt = "\n".join(parts).strip()
-                        if txt and not txt.startswith("<permissions"):
+                        if txt and not txt.startswith(("<permissions", "<environment_context", "<user_instructions", "<!-- AGY-BRIDGE")):
                             turns.append({"role": role, "text": txt, "timestamp": rec.get("timestamp", "")})
+                    elif payload.get("type") in ("function_call", "custom_tool_call"):
+                        raw_in = payload.get("input") or payload.get("arguments") or ""
+                        if not isinstance(raw_in, str):
+                            raw_in = json.dumps(raw_in, ensure_ascii=False)
+                        if "*** " in raw_in and "File:" in raw_in:
+                            raw_in = raw_in.replace("\\n", "\n")
+                            for fm in re.finditer(r"\*\*\* (?:Add|Update|Delete) File: ([^\n\"]+)", raw_in):
+                                fp = fm.group(1).strip()
+                                if fp and fp not in modified_files:
+                                    modified_files.append(fp)
     except Exception:
         pass
 
@@ -5107,7 +5148,8 @@ def cmd_hook_sync(args: argparse.Namespace) -> int:
     except Exception:
         hook_input = {}
 
-    is_agy = bool(getattr(args, "agy_hook", False) or "conversationId" in hook_input or "terminationReason" in hook_input or "invocationNum" in hook_input)
+    is_codex = bool(getattr(args, "codex_hook", False))
+    is_agy = (not is_codex) and bool(getattr(args, "agy_hook", False) or "conversationId" in hook_input or "terminationReason" in hook_input or "invocationNum" in hook_input)
     event_name = getattr(args, "event", None) or hook_input.get("hook_event_name") or hook_input.get("hookEventName") or ""
     if not event_name:
         if "terminationReason" in hook_input:
@@ -5137,7 +5179,7 @@ def cmd_hook_sync(args: argparse.Namespace) -> int:
             base_repo, active_ws, _ = resolve_repo_and_worktree(p)
             bdir = get_git_common_bridge_dir(base_repo)
             live_file = bdir / "LIVE_STATE.md"
-            reader_key = f"cursor_{'agy' if is_agy else 'claude'}.sha256"
+            reader_key = f"cursor_{'codex' if is_codex else ('agy' if is_agy else 'claude')}.sha256"
             cursor_file = bdir / reader_key
 
             # Only run full 3-layer sync on write/stop events (PostToolUse, Stop, StopFailure),
@@ -5186,7 +5228,17 @@ def cmd_hook_sync(args: argparse.Namespace) -> int:
     except Exception:
         pass
 
-    # Output exact contract required by Antigravity 2.0 or Claude Code
+    # Output exact contract required by Antigravity 2.0, OpenAI Codex or Claude Code
+    if is_codex:
+        # Codex: SessionStart/UserPromptSubmit accept hookSpecificOutput.additionalContext;
+        # Stop requires JSON on stdout when exiting 0; PostToolUse ignores plain stdout.
+        if event_name in ("SessionStart", "UserPromptSubmit") and live_state_content and state_changed_for_reader:
+            print(json.dumps({
+                "hookSpecificOutput": {"hookEventName": event_name, "additionalContext": live_state_content}
+            }, ensure_ascii=False))
+        elif event_name == "Stop":
+            print("{}")
+        return 0
     if is_agy:
         if event_name == "Stop":
             print(json.dumps({"decision": "allow"}))
@@ -5208,6 +5260,85 @@ def cmd_hook_sync(args: argparse.Namespace) -> int:
             }, ensure_ascii=False))
         return 0
     return 0
+
+
+CODEX_HOOKS_FILE = CODEX_DIR / "hooks.json"
+CODEX_HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop")
+
+
+def build_codex_hooks_config(existing: Optional[Dict[str, Any]], agy_bridge_bin: str) -> Dict[str, Any]:
+    """
+    Merge agy-bridge entries into a Codex `hooks.json` object (event -> matcher groups -> handlers),
+    replacing older agy-bridge entries and keeping every foreign hook untouched.
+    Format per Codex docs: {"hooks": {"Event": [{"matcher": "...", "hooks": [{"type": "command", ...}]}]}}.
+    """
+    cfg: Dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+    hooks = cfg.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+    for ev in list(hooks.keys()):
+        groups = hooks.get(ev)
+        if isinstance(groups, list):
+            kept = [g for g in groups if "agy-bridge hook-sync" not in json.dumps(g) and f"{agy_bridge_bin} hook-sync" not in json.dumps(g)]
+            if kept:
+                hooks[ev] = kept
+            else:
+                del hooks[ev]
+
+    def _cmd(ev: str) -> str:
+        return f"{agy_bridge_bin} hook-sync --codex-hook --event {ev}"
+
+    ours = {
+        # sync: injects LIVE_STATE only when another agent changed it (cursor_codex.sha256)
+        "SessionStart": {"hooks": [{"type": "command", "command": _cmd("SessionStart"), "timeout": 20}]},
+        "UserPromptSubmit": {"hooks": [{"type": "command", "command": _cmd("UserPromptSubmit"), "timeout": 10}]},
+        # background checkpoints: never slow the turn down
+        "PostToolUse": {"matcher": "^(apply_patch|Edit|Write)$",
+                        "hooks": [{"type": "command", "command": _cmd("PostToolUse"), "timeout": 30, "async": True}]},
+        # Stop is synchronous on purpose: `codex exec` exits right after the turn and kills async hooks
+        "Stop": {"hooks": [{"type": "command", "command": _cmd("Stop"), "timeout": 30,
+                            "statusMessage": "agy-bridge: syncing context"}]},
+    }
+    for ev, grp in ours.items():
+        hooks.setdefault(ev, []).append(grp)
+    cfg["hooks"] = hooks
+    return cfg
+
+
+def install_codex_hooks(agy_bridge_bin: str) -> bool:
+    if not CODEX_DIR.exists():
+        return False
+    existing: Dict[str, Any] = {}
+    if CODEX_HOOKS_FILE.exists():
+        try:
+            existing = json.loads(CODEX_HOOKS_FILE.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return False  # never clobber a hooks.json we can't parse
+    cfg = build_codex_hooks_config(existing, agy_bridge_bin)
+    atomic_write_text(CODEX_HOOKS_FILE, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    return True
+
+
+def codex_hooks_status() -> Dict[str, Any]:
+    """What `doctor` can verify from disk: installed events, feature flag, trust entries, notify untouched."""
+    st: Dict[str, Any] = {"installed": [], "feature_disabled": False, "trusted_entries": 0, "notify": False}
+    if CODEX_HOOKS_FILE.exists():
+        try:
+            hk = (json.loads(CODEX_HOOKS_FILE.read_text(encoding="utf-8")) or {}).get("hooks") or {}
+            st["installed"] = [ev for ev in CODEX_HOOK_EVENTS if "hook-sync --codex-hook" in json.dumps(hk.get(ev) or [])]
+        except Exception:
+            pass
+    toml_p = CODEX_DIR / "config.toml"
+    if toml_p.exists():
+        try:
+            txt = toml_p.read_text(encoding="utf-8", errors="replace")
+            st["feature_disabled"] = bool(re.search(r"(?ms)^\[features\][^\[]*^\s*(?:hooks|codex_hooks)\s*=\s*false", txt))
+            # Codex persists per-hook trust as [hooks.state."<key>"] trusted_hash = "..."
+            st["trusted_entries"] = len(re.findall(r'(?m)^\[hooks\.state\."[^"]*hooks\.json[^"]*"\]', txt))
+            st["notify"] = bool(re.search(r"(?m)^notify\s*=", txt))
+        except Exception:
+            pass
+    return st
 
 
 def cmd_install_hooks(args: argparse.Namespace) -> int:
@@ -5388,11 +5519,23 @@ def cmd_install_hooks(args: argparse.Namespace) -> int:
         except Exception:
             pass
 
+    # 6. Codex lifecycle hooks in ~/.codex/hooks.json (existing `notify` in config.toml is left untouched)
+    codex_hooks_ok = False
+    try:
+        codex_hooks_ok = install_codex_hooks(agy_bridge_bin)
+    except Exception:
+        pass
+
     print("[agy-bridge v0.3] Installed Zero-Terminal Hooks + MCP Server Across All IDEs:")
     print(f"  1. Claude Hooks & Inbound : {CLAUDE_SETTINGS_FILE} (SessionStart, UserPromptSubmit, PostToolUse, Stop, StopFailure)")
     print(f"  2. Antigravity Plugin     : {plugin_dir} (SessionStart, PreInvocation, PostToolUse, Stop + Rules)")
     print(f"  3. MCP Server Registered  : Antigravity (`mcp_config.json`), Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`)")
     print(f"  4. Short CLI Alias        : {ab_alias} -> {agy_bridge_bin}")
+    if codex_hooks_ok:
+        print(f"  5. Codex Hooks            : {CODEX_HOOKS_FILE} (SessionStart, UserPromptSubmit, PostToolUse, Stop)")
+        print("     ↳ Codex runs new hooks only after you trust them once: Codex app → Settings → Hooks (CLI: /hooks)")
+    else:
+        print("  5. Codex Hooks            : skipped (~/.codex missing or hooks.json unreadable)")
     return 0
 
 
@@ -5427,6 +5570,20 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
             except Exception:
                 pass
 
+    if CODEX_HOOKS_FILE.exists():
+        try:
+            cj = json.loads(CODEX_HOOKS_FILE.read_text(encoding="utf-8")) or {}
+            hk = cj.get("hooks") or {}
+            for ev in list(hk.keys()):
+                if isinstance(hk[ev], list):
+                    hk[ev] = [g for g in hk[ev] if "hook-sync --codex-hook" not in json.dumps(g)]
+                    if not hk[ev]:
+                        del hk[ev]
+            cj["hooks"] = hk
+            atomic_write_text(CODEX_HOOKS_FILE, json.dumps(cj, indent=2, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
     print("[agy-bridge] Cleanly uninstalled global hooks, plugin, and MCP entries.")
     return 0
 
@@ -5452,6 +5609,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"  [{'OK' if agy_plugin_ok else 'MISS'}] Antigravity Hooks      : {'Installed (~/.gemini/config/plugins/agy-bridge)' if agy_plugin_ok else 'Missing'}")
     print(f"  [{'OK' if agy_mcp_ok else 'MISS'}] MCP Server (AGY/Claude): {'Registered (agy-bridge mcp)' if agy_mcp_ok else 'Missing'}")
     print(f"  [{'OK' if codex_mcp_ok else 'MISS'}] MCP Server (Codex)     : {'Registered in ~/.codex/config.toml' if codex_mcp_ok else 'Missing'}")
+    cx = codex_hooks_status()
+    if cx["feature_disabled"]:
+        print("  [WARN] Codex Lifecycle Hooks  : disabled via [features] hooks = false in ~/.codex/config.toml")
+    elif len(cx["installed"]) == len(CODEX_HOOK_EVENTS):
+        trust_txt = (f"{cx['trusted_entries']} trusted entr(y/ies) in config.toml" if cx["trusted_entries"]
+                     else "NOT trusted yet → Codex app: Settings → Hooks (CLI: /hooks)")
+        print(f"  [{'OK' if cx['trusted_entries'] else 'WARN'}] Codex Lifecycle Hooks  : Installed ({'/'.join(cx['installed'])}); {trust_txt}")
+    else:
+        print(f"  [MISS] Codex Lifecycle Hooks  : {'partial: ' + '/'.join(cx['installed']) if cx['installed'] else 'Run agy-bridge install-hooks'}")
+    print(f"  [INFO] Codex notify          : {'kept as-is (not used by agy-bridge)' if cx['notify'] else 'not set'}")
     print(f"  [INFO] Live Claude Sockets  : {len(sockets)} active (/tmp/cc-socks/*.sock)")
     return 0
 
@@ -5809,6 +5976,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_hs.add_argument("-w", "--workspace", default=None, help="Optional workspace path override")
     p_hs.add_argument("--event", default=None, help="Hook event name (SessionStart, UserPromptSubmit, PreInvocation, PostToolUse, Stop, StopFailure)")
     p_hs.add_argument("--agy-hook", action="store_true", help="Output Antigravity hook JSON contract")
+    p_hs.add_argument("--codex-hook", action="store_true", help="Output OpenAI Codex hook JSON contract (cursor_codex.sha256)")
     p_hs.set_defaults(func=cmd_hook_sync)
 
     # install-hooks / init

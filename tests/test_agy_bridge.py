@@ -816,5 +816,120 @@ class TestAgyBridgeV03(unittest.TestCase):
             srv.close()
 
 
+    def test_16_demo_port_warning_script_end_to_end(self) -> None:
+        import socket
+
+        script = REPO_ROOT / "scripts" / "demo-port-warning.sh"
+        self.assertTrue(os.access(script, os.X_OK))
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        env = dict(os.environ, DEMO_PORT=str(port), DEMO_PAUSE="0")
+        r = subprocess.run([str(script)], capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"⚠️ Port {port} needed by this project (.env PORT) is held by unrelated process", r.stdout)
+        self.assertNotIn("/var/folders", r.stdout)  # no long temp paths in the video
+        # cleanup: nothing listens on the port anymore
+        chk = socket.socket()
+        try:
+            chk.bind(("127.0.0.1", port))
+        finally:
+            chk.close()
+
+    def test_17_codex_hooks_config_and_hook_contract(self) -> None:
+        binp = "/x/bin/agy-bridge"
+        foreign = {"hooks": {"PreToolUse": [{"matcher": "^Bash$", "hooks": [{"type": "command", "command": "python3 guard.py"}]}],
+                             "Stop": [{"hooks": [{"type": "command", "command": "say done"}]},
+                                      {"hooks": [{"type": "command", "command": f"{binp} hook-sync --codex-hook --event Stop"}]}]},
+                   "other_key": 1}
+        cfg = ab.build_codex_hooks_config(foreign, binp)
+        cfg2 = ab.build_codex_hooks_config(cfg, binp)  # idempotent re-install
+        self.assertEqual(cfg, cfg2)
+        hk = cfg["hooks"]
+        self.assertEqual(cfg["other_key"], 1)
+        self.assertEqual(hk["PreToolUse"][0]["hooks"][0]["command"], "python3 guard.py")  # foreign kept
+        self.assertEqual(len(hk["Stop"]), 2)  # foreign `say done` + exactly one of ours
+        self.assertEqual(hk["Stop"][0]["hooks"][0]["command"], "say done")
+        for ev in ab.CODEX_HOOK_EVENTS:
+            self.assertIn(f"{binp} hook-sync --codex-hook --event {ev}", json.dumps(hk[ev]))
+        self.assertEqual(hk["PostToolUse"][-1]["matcher"], "^(apply_patch|Edit|Write)$")
+        self.assertTrue(hk["PostToolUse"][-1]["hooks"][0]["async"])
+        self.assertNotIn("async", hk["Stop"][-1]["hooks"][0])  # `codex exec` kills async hooks at exit
+
+        # install / status / uninstall against a fake CODEX_DIR (notify must stay untouched)
+        from unittest import mock
+        cdir = self.tmp_dir / "codex_home"
+        cdir.mkdir()
+        toml = 'notify = ["/x/Sky", "turn-ended"]\nmodel = "m"\n'
+        (cdir / "config.toml").write_text(toml, encoding="utf-8")
+        with mock.patch.object(ab, "CODEX_DIR", cdir), mock.patch.object(ab, "CODEX_HOOKS_FILE", cdir / "hooks.json"):
+            self.assertTrue(ab.install_codex_hooks(binp))
+            st = ab.codex_hooks_status()
+            self.assertEqual(st["installed"], list(ab.CODEX_HOOK_EVENTS))
+            self.assertEqual(st["trusted_entries"], 0)
+            self.assertTrue(st["notify"])
+            (cdir / "config.toml").write_text(toml + f'\n[hooks.state."{cdir}/hooks.json:stop:0:0"]\ntrusted_hash = "abc"\n', encoding="utf-8")
+            self.assertEqual(ab.codex_hooks_status()["trusted_entries"], 1)
+            (cdir / "config.toml").write_text(toml + "\n[features]\nhooks = false\n", encoding="utf-8")
+            self.assertTrue(ab.codex_hooks_status()["feature_disabled"])
+            (cdir / "hooks.json").write_text("{broken", encoding="utf-8")
+            self.assertFalse(ab.install_codex_hooks(binp))  # never clobber unparsable user file
+            self.assertEqual((cdir / "hooks.json").read_text(encoding="utf-8"), "{broken")
+        self.assertTrue((cdir / "config.toml").read_text(encoding="utf-8").startswith(toml))
+
+        # real hook-sync process with Codex stdin contract + cursor_codex.sha256 delta
+        repo = self.tmp_dir / "codex-hook-repo"
+        self._init_git_repo(repo)
+
+        def hook(ev: str) -> str:
+            payload = {"session_id": "cx-1", "transcript_path": None, "cwd": str(repo), "hook_event_name": ev, "model": "m"}
+            if ev == "SessionStart":
+                payload["source"] = "startup"
+            if ev == "Stop":
+                payload.update({"turn_id": "t1", "stop_hook_active": False, "last_assistant_message": "ok"})
+            r = subprocess.run([sys.executable, str(AGY_BRIDGE_BIN), "hook-sync", "--codex-hook", "--event", ev],
+                               input=json.dumps(payload), capture_output=True, text=True, timeout=120,
+                               env=dict(os.environ, AGY_BRIDGE_NO_DOCKER="1"))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout.strip()
+
+        out = hook("SessionStart")
+        obj = json.loads(out)
+        self.assertEqual(obj["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        self.assertIn("AGY-BRIDGE:AUTO-STATE", obj["hookSpecificOutput"]["additionalContext"])
+        bdir = ab.get_git_common_bridge_dir(repo)
+        self.assertTrue((bdir / "cursor_codex.sha256").exists())
+        self.assertEqual(hook("UserPromptSubmit"), "")  # nothing changed -> 0 tokens
+        self.assertEqual(json.loads(hook("Stop")), {})   # Stop must answer with JSON
+        ab.record_repo_decision(repo, summary="Use port 3001 for the API", reason="3000 is taken", kind="decision", agent="claude")
+        ab.cmd_sync(ab.argparse.Namespace(target=str(repo), workspace=str(repo), quiet=True, write_docs=False))
+        out = hook("UserPromptSubmit")
+        self.assertIn("Use port 3001 for the API", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(hook("UserPromptSubmit"), "")
+
+    def test_18_codex_rollout_fallback_and_apply_patch_files(self) -> None:
+        sdir = self.tmp_dir / "sessions" / "2026" / "11" / "10"
+        sdir.mkdir(parents=True)
+        sid = "01a1c000-1111-7222-8333-944455556666"
+        f = sdir / f"rollout-2026-11-10T10-00-00-{sid}.jsonl"
+        patch = "*** Begin Patch\n*** Update File: src/app.py\n@@\n-a\n+b\n*** Add File: docs/new.md\n+x\n*** End Patch"
+        recs = [
+            {"type": "session_meta", "payload": {"id": sid, "cwd": "/w/proj", "git": {"branch": "feat"}}},
+            {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix the bug"}]}},
+            {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch}},
+            {"type": "response_item", "payload": {"type": "function_call", "name": "apply_patch", "arguments": json.dumps({"input": "*** Begin Patch\n*** Delete File: old.txt\n*** End Patch"})}},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}},
+        ]
+        f.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
+        th = ab.scan_codex_rollouts(5, sessions_dir=self.tmp_dir / "sessions")
+        self.assertEqual(len(th), 1)
+        self.assertEqual((th[0]["id"], th[0]["cwd"], th[0]["gitBranch"]), (sid, "/w/proj", "feat"))
+        parsed = ab.parse_codex_jsonl(f)
+        self.assertEqual(parsed["modifiedFiles"], ["src/app.py", "docs/new.md", "old.txt"])
+        self.assertEqual(parsed["totalTurns"], 2)
+        self.assertEqual(ab.scan_codex_rollouts(5, sessions_dir=self.tmp_dir / "nope"), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

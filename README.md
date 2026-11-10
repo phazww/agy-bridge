@@ -23,6 +23,8 @@ When you hit a rate limit mid-task in **Claude Code**, or switch to **Antigravit
 - **Active Dev Servers & Port Detection**: Automatically detects running local dev servers (`localhost:3000 (node, PID 12345)`) bound to the project or active worktree so the next agent never spawns a duplicate server on a busy port.
 - **Compose Pre-flight (before `docker compose up`)**: runs `docker compose config --format json` (1.5s timeout, cached by compose/`.env` mtime, only on SessionStart/Stop) and flags `⛔` when a published host port is already taken by a neighbor worktree or another process — so the bind never fails. `AGY_BRIDGE_NO_DOCKER=1` disables it.
 - **Foreign Port Holders**: reads only `*PORT*` keys from `.env` files (numeric values, nothing else) and warns `⚠️` when a port the project needs is held by an unrelated process outside the repo (e.g. a Homebrew Postgres on 5432), without listing any other foreign listeners.
+- **Codex Lifecycle Hooks**: `~/.codex/hooks.json` gets `SessionStart`, `UserPromptSubmit`, `PostToolUse` (`apply_patch|Edit|Write`) and `Stop`, with its own delta cursor (`cursor_codex.sha256`). Your existing `notify` stays untouched. Codex has no rate-limit failure hook (no `StopFailure` equivalent), and new hooks only run after you trust them once in Codex: **Settings → Hooks** (CLI: `/hooks`). `agy-bridge doctor` shows whether they are trusted.
+- **Port-warning demo**: `scripts/demo-port-warning.sh` reproduces the `⚠️` port warning in ~20s inside a temp repo and cleans up after itself (no Docker needed).
 - **Built-in MCP Server (`agy-bridge mcp`, <180 tokens schema)**: Just tell any IDE in plain chat *"continue where Claude stopped"* or *"check what the other agent did"* — the agent calls the native MCP tool automatically.
 
 ---
@@ -74,6 +76,7 @@ What `./install.sh` (`agy-bridge install-hooks`) configures automatically:
 2. **Claude Hooks**: Registers `SessionStart`, `UserPromptSubmit`, `PostToolUse` (`Edit|Write|MultiEdit`), `Stop`, and `StopFailure` in `~/.claude/settings.json`.
 3. **Antigravity 2.0 Plugin**: Installs `~/.gemini/config/plugins/agy-bridge/` (`SessionStart`, `PreInvocation`, `PostToolUse`, `Stop` hooks + rules + MCP).
 4. **MCP Server Across All IDEs**: Registers `agy_bridge` (`agy-bridge mcp`) in Antigravity (`mcp_config.json`), Claude (`~/.claude.json`), and Codex (`~/.codex/config.toml`).
+5. **Codex Hooks**: Writes agy-bridge entries into `~/.codex/hooks.json`, merged with any hooks you already have. Trust them once in Codex: Settings → Hooks.
 
 ---
 
