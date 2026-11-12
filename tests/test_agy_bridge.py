@@ -931,5 +931,54 @@ class TestAgyBridgeV03(unittest.TestCase):
         self.assertEqual(ab.scan_codex_rollouts(5, sessions_dir=self.tmp_dir / "nope"), [])
 
 
+    def test_19_standalone_docker_compose_fallback_and_real_fixture(self) -> None:
+        from unittest import mock
+
+        fx = REPO_ROOT / "tests" / "fixtures" / "compose-real"
+        real_json = (fx / "config.json").read_text(encoding="utf-8")
+
+        # Parsing REAL `docker-compose config --format json` output (Compose 5.7.0, DB_PORT=5433 from .env)
+        parsed = ab.parse_compose_config_ports(real_json)
+        self.assertEqual(parsed["project"], "compose-real")
+        self.assertEqual([(x["port"], x["service"], x["host_ip"]) for x in parsed["ports"]],
+                         [(3000, "web", ""), (3001, "web", ""), (5433, "db", "127.0.0.1")])
+
+        # PATH with ONLY a fake standalone docker-compose (no docker CLI)
+        bindir = self.tmp_dir / "bin"
+        bindir.mkdir()
+        argv_log = self.tmp_dir / "argv.txt"
+        fake = bindir / "docker-compose"
+        fake.write_text(f"#!/bin/sh\necho \"$@\" > '{argv_log}'\n/bin/cat '{fx / 'config.json'}'\n", encoding="utf-8")
+        fake.chmod(0o755)
+        repo = self.tmp_dir / "standalone-repo"
+        self._init_git_repo(repo)
+        shutil.copy(fx / "compose.yaml", repo / "compose.yaml")
+        shutil.copy(fx / ".env", repo / ".env")
+
+        env = {k: v for k, v in os.environ.items() if k != "AGY_BRIDGE_NO_DOCKER"}
+        env["PATH"] = str(bindir)
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(ab, "_find_docker_bin", return_value=None), \
+             mock.patch.object(ab, "STANDALONE_COMPOSE_CANDIDATES", ()):
+            cmd = ab.find_compose_command()
+            self.assertEqual(cmd, [str(fake)])
+            self.assertEqual(ab.describe_compose_command(cmd), "standalone docker-compose")
+            out = ab.run_compose_config(repo)
+            self.assertEqual(argv_log.read_text(encoding="utf-8").strip(), "config --format json")
+            self.assertEqual(json.loads(out)["name"], "compose-real")
+            ports = ab.compose_preflight_ports(repo, self.tmp_dir / "cache")
+            self.assertEqual(sorted({p["port"] for p in ports}), [3000, 3001, 5433])
+            self.assertEqual({p["source"] for p in ports}, {"compose:web", "compose:db"})
+            # docker CLI present -> `docker compose` wins over standalone
+            with mock.patch.object(ab, "_find_docker_bin", return_value="/x/docker"):
+                self.assertEqual(ab.find_compose_command(), ["/x/docker", "compose"])
+                self.assertEqual(ab.describe_compose_command(ab.find_compose_command()), "docker compose")
+            # kill switch still wins
+            with mock.patch.dict(os.environ, {"AGY_BRIDGE_NO_DOCKER": "1"}):
+                self.assertIsNone(ab.find_compose_command())
+                self.assertIsNone(ab.run_compose_config(repo))
+            self.assertEqual(ab.describe_compose_command(None), "none")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,0 +1,4 @@
+services:
+  db:    {image: postgres:16, ports: ["127.0.0.1:${DB_PORT:-5432}:5432"]}
+  web:   {image: node:22, ports: ["3000-3001:3000-3001", "9229", "5353:53/udp"]}
+  cache: {image: redis:7, ports: ["6379"]}

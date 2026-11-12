@@ -1,0 +1,76 @@
+{
+  "name": "compose-real",
+  "networks": {
+    "default": {
+      "name": "compose-real_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "cache": {
+      "command": null,
+      "entrypoint": null,
+      "image": "redis:7",
+      "networks": {
+        "default": null
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "target": 6379,
+          "protocol": "tcp"
+        }
+      ]
+    },
+    "db": {
+      "command": null,
+      "entrypoint": null,
+      "image": "postgres:16",
+      "networks": {
+        "default": null
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "host_ip": "127.0.0.1",
+          "target": 5432,
+          "published": "5433",
+          "protocol": "tcp"
+        }
+      ]
+    },
+    "web": {
+      "command": null,
+      "entrypoint": null,
+      "image": "node:22",
+      "networks": {
+        "default": null
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "target": 3000,
+          "published": "3000",
+          "protocol": "tcp"
+        },
+        {
+          "mode": "ingress",
+          "target": 3001,
+          "published": "3001",
+          "protocol": "tcp"
+        },
+        {
+          "mode": "ingress",
+          "target": 9229,
+          "protocol": "tcp"
+        },
+        {
+          "mode": "ingress",
+          "target": 53,
+          "published": "5353",
+          "protocol": "udp"
+        }
+      ]
+    }
+  }
+}

@@ -2811,6 +2811,38 @@ def _find_docker_bin() -> Optional[str]:
     return None
 
 
+STANDALONE_COMPOSE_CANDIDATES = (
+    "/opt/homebrew/bin/docker-compose",
+    "/usr/local/bin/docker-compose",
+    str(Path.home() / ".docker/cli-plugins/docker-compose"),
+    "/opt/homebrew/lib/docker/cli-plugins/docker-compose",
+)
+
+
+def find_compose_command() -> Optional[List[str]]:
+    """
+    argv prefix for `compose config` (no daemon needed):
+      1. `docker compose` when a docker CLI exists;
+      2. otherwise a standalone `docker-compose` (brew formula / cli-plugin binary run directly).
+    None when AGY_BRIDGE_NO_DOCKER=1 or nothing is installed.
+    """
+    if os.environ.get("AGY_BRIDGE_NO_DOCKER") == "1":
+        return None
+    docker_bin = _find_docker_bin()
+    if docker_bin:
+        return [docker_bin, "compose"]
+    for c in (shutil.which("docker-compose"),) + STANDALONE_COMPOSE_CANDIDATES:
+        if c and Path(c).is_file() and os.access(c, os.X_OK):
+            return [c]
+    return None
+
+
+def describe_compose_command(cmd: Optional[List[str]]) -> str:
+    if not cmd:
+        return "none"
+    return "docker compose" if len(cmd) == 2 else "standalone docker-compose"
+
+
 def _docker_daemon_likely_up() -> bool:
     """Cheap socket-existence check so hooks never pay the docker CLI timeout when Docker is off."""
     if os.environ.get("DOCKER_HOST"):
@@ -3092,15 +3124,13 @@ def parse_compose_config_ports(config_json: str) -> Dict[str, Any]:
 
 
 def run_compose_config(unit_dir: Path) -> Optional[str]:
-    """`docker compose config --format json` in the unit dir (native .env interpolation). None on any failure."""
-    if os.environ.get("AGY_BRIDGE_NO_DOCKER") == "1":
-        return None
-    docker_bin = _find_docker_bin()
-    if not docker_bin:
+    """`<compose> config --format json` in the unit dir (native .env interpolation). None on any failure."""
+    compose_cmd = find_compose_command()
+    if not compose_cmd:
         return None
     try:
         r = subprocess.run(
-            [docker_bin, "compose", "config", "--format", "json"],
+            compose_cmd + ["config", "--format", "json"],
             cwd=str(unit_dir),
             capture_output=True,
             text=True,
@@ -5609,6 +5639,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"  [{'OK' if agy_plugin_ok else 'MISS'}] Antigravity Hooks      : {'Installed (~/.gemini/config/plugins/agy-bridge)' if agy_plugin_ok else 'Missing'}")
     print(f"  [{'OK' if agy_mcp_ok else 'MISS'}] MCP Server (AGY/Claude): {'Registered (agy-bridge mcp)' if agy_mcp_ok else 'Missing'}")
     print(f"  [{'OK' if codex_mcp_ok else 'MISS'}] MCP Server (Codex)     : {'Registered in ~/.codex/config.toml' if codex_mcp_ok else 'Missing'}")
+    cc = find_compose_command()
+    print(f"  [{'OK' if cc else 'INFO'}] Compose pre-flight     : "
+          + (f"{describe_compose_command(cc)} ({cc[0]})" if cc else
+             ("disabled (AGY_BRIDGE_NO_DOCKER=1)" if os.environ.get("AGY_BRIDGE_NO_DOCKER") == "1" else "none (no docker / docker-compose CLI)")))
     cx = codex_hooks_status()
     if cx["feature_disabled"]:
         print("  [WARN] Codex Lifecycle Hooks  : disabled via [features] hooks = false in ~/.codex/config.toml")
